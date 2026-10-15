@@ -72,6 +72,9 @@ def cmd_doctor(args) -> int:
     print('平台：%s %s / Python %s' % (platform.system(), platform.machine(),
                                       platform.python_version()))
     available = _print_status()
+    print('原生库依赖：')
+    for line in dmsdk.dependency_report().splitlines():
+        print('  %s' % line.strip())
     if available:
         try:
             entries = dmcan_iface.list_devices(refresh=True)

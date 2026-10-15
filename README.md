@@ -244,6 +244,7 @@ dronecan-gui-tool-dm/
 | 现象 | 原因与处理 |
 | --- | --- |
 | 接口列表里没有 `dmcan:` 项 | 跑 `doctor`：多半是没装 `dmcan_sdk` 或没找到 `libdmcan`（提示里会写清楚） |
+| `libdmcan 原生库加载失败：OSError [WinError 127] 找不到指定的程序` | **依赖 DLL 被 PATH 里的同名文件顶掉**。dmcan_sdk 用 `CDLL(path, winmode=0)` 加载原生库，这个标志走 Windows 标准搜索顺序——依赖只会从"exe 目录 / System32 / 当前目录 / PATH"里找，**不会**从 `libdmcan.dll` 自己的目录找。装了 ST-Link / QEMU / MSYS2 / OpenOCD / STM32CubeCLT 的机器上，PATH 里普遍有别的 `libstdc++-6.dll` / `libgcc_s_seh-1.dll` / `libwinpthread-1.dll` / `libusb-1.0.dll`，于是"文件找到了但缺导出符号"，报 127（不是 126）。**本工具已修**：`dmsdk.preload_dependencies()` 在加载原生库之前，先按**绝对路径**把 `dlls/` 里的 4 个依赖装进进程模块表，之后 `libdmcan.dll` 按名字引用时直接命中我们那一份，结果与 PATH 无关。仍失败就 `doctor` 看"原生库依赖"一节解析到了哪个路径 |
 | `打开设备失败 ... 被别的进程占用` | Windows 下串口助手 / 另一个 GUI 实例占着；本工具会**自动重试 3 次**，仍失败就关掉占用方 |
 | `使能通道失败` | 固件过旧：通道开/关要求固件回 2 字节应答，需 V2.0.0 及以上、构建标识 ≥ 双路 `b5c2574`（`info` 里能直接看到） |
 | `按序列号没找到设备` | 序列号偶尔会读空（上一个进程刚释放 USB 句柄时）。工具会自动刷新一次重试；仍不行就改用下标（`dmcan:0.1`） |
@@ -252,6 +253,18 @@ dronecan-gui-tool-dm/
 | 收不到帧 | 先跑 `selftest`（外部回环）确认"自己能收自己"；再查两端波特率/采样点、终端电阻、经典 vs FD、通道是否使能 |
 | 想降总线负载 | 上游的 `--filtered`（低带宽过滤）对 dmcan 后端**刻意不实现**：USB 通路的带宽不需要过滤，而 DroneCAN 需要收到全部帧（动态节点 ID 分配、param/file 服务、匿名帧都靠它） |
 | GUI 里看不到丢帧 | **Tools → CAN Adapter Control Panel**：设备侧与主机侧的丢帧计数都在那里 |
+| PowerShell 里 `run_gui.bat` 没反应 | 要写成 `.\.run_gui.bat dmcan:0.0`（PowerShell 不会从当前目录直接执行）；也不要 `python run_gui.bat` |
+
+> `doctor` 会打印原生库依赖的实际解析路径，排查这类"到底用了哪一份 DLL"的问题时先看它：
+>
+> ```
+> dmsdk 可用（libdmcan 2.1.0：...\dlls\libdmcan.dll）
+> 原生库依赖：
+>   libwinpthread-1.dll -> ...\dlls\libwinpthread-1.dll
+>   libgcc_s_seh-1.dll -> ...\dlls\libgcc_s_seh-1.dll
+>   libstdc++-6.dll -> ...\dlls\libstdc++-6.dll
+>   libusb-1.0.dll -> ...\dlls\libusb-1.0.dll
+> ```
 
 ---
 

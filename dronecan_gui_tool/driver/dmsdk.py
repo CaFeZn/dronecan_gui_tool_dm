@@ -27,11 +27,12 @@ dmsdk（达妙 dmcan）**可选依赖的唯一入口**。
 
 from __future__ import annotations
 
+import ctypes
 import logging
 import os
 import sys
 from dataclasses import dataclass
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +51,14 @@ INSTALL_HINT = ('pip install dmcan_sdk；离线时用 '
 
 LIBRARY_NAME_HINT = ('设置 DMCAN_LIBRARY_PATH 指向 libdmcan 完整路径，'
                      '或运行 tools/fetch_dmcan_lib.py 把原生库拷到本工程的 dlls/')
+
+#: Windows 上 `libdmcan.dll` 的运行期依赖，**必须与它同目录**。
+#: 顺序 = 依赖顺序（winpthread -> gcc -> stdc++ -> usb），先加载被依赖的。
+WINDOWS_DEPENDENCIES = ('libwinpthread-1.dll', 'libgcc_s_seh-1.dll',
+                        'libstdc++-6.dll', 'libusb-1.0.dll')
+
+#: 已经预加载过的依赖：文件名 -> 实际落盘的路径（用来诊断"用错了哪一份"）。
+loaded_dependencies: Dict[str, str] = {}
 
 
 class SdkUnavailable(RuntimeError):
@@ -164,6 +173,68 @@ def _package_version() -> str:
             return ''
 
 
+def _module_file_path(module) -> str:
+    """@brief 取一个已加载 DLL 的真实落盘路径（`GetModuleFileNameW`）。"""
+    try:
+        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        buffer = ctypes.create_unicode_buffer(2048)
+        written = kernel32.GetModuleFileNameW(ctypes.c_void_p(module._handle), buffer, 2048)
+        return buffer.value if written else ''
+    except Exception:  # pragma: no cover - 依赖环境
+        return ''
+
+
+def preload_dependencies(library_path: Optional[str]) -> Dict[str, str]:
+    """
+    @brief 在加载 `libdmcan` 之前，按**绝对路径**预加载它同目录的依赖 DLL。
+
+    为什么必须这么做：dmcan_sdk 用 `CDLL(path, winmode=0)` 加载原生库，
+    这个标志走的是 Windows 的**标准搜索顺序**——依赖 DLL 只会从"exe 所在目录 /
+    System32 / 当前目录 / PATH"里找，**不会**从 `libdmcan.dll` 自己的目录找。
+    于是同一台机器上 PATH 里只要有一份版本不对的 `libstdc++-6.dll` /
+    `libusb-1.0.dll`（装了 ST-Link、QEMU、MSYS2、OpenOCD 的机器基本都有），
+    就会报 `WinError 127 找不到指定的程序`（找到了文件但缺导出符号）。
+
+    先按绝对路径把正确的几份装进进程模块表，之后 `libdmcan.dll` 按名字引用它们时
+    会直接命中已加载的那一份，结果与 PATH 无关。
+
+    @param library_path `libdmcan` 的完整路径；None 时不做任何事
+    @return 文件名 -> 实际加载的路径
+    @raise SdkUnavailable 某个依赖存在但加载失败（版本损坏/位数不匹配）
+    """
+    loaded_dependencies.clear()
+    if sys.platform != 'win32' or not library_path:
+        return {}
+    directory = os.path.dirname(os.path.abspath(library_path))
+    for name in WINDOWS_DEPENDENCIES:
+        path = os.path.join(directory, name)
+        if not os.path.isfile(path):
+            logger.debug('依赖 %s 不在 %s（交给系统搜索路径）', name, directory)
+            continue
+        try:
+            module = ctypes.WinDLL(path)
+        except OSError as ex:
+            raise SdkUnavailable('依赖 DLL 加载失败：%s（%s）：%s' % (name, path, ex)) from ex
+        resolved = _module_file_path(module) or path
+        loaded_dependencies[name] = resolved
+        if os.path.normcase(os.path.abspath(resolved)) != os.path.normcase(os.path.abspath(path)):
+            # 系统里已有同名模块（先被别的组件加载了），这一份用不上
+            logger.warning('依赖 %s 用的是进程里已有的 %s（不是 %s）', name, resolved, path)
+        else:
+            logger.debug('依赖 %s 已从 %s 预加载', name, resolved)
+    return dict(loaded_dependencies)
+
+
+def dependency_report() -> str:
+    """@brief 依赖 DLL 的解析结果（一行一条），用于 doctor 与报错。"""
+    if not loaded_dependencies:
+        return '（未预加载依赖；可能是非 Windows，或还没成功定位 libdmcan）'
+    lines = []
+    for name, path in loaded_dependencies.items():
+        lines.append('%s -> %s' % (name, path))
+    return '\n    '.join(lines)
+
+
 def get_context(refresh: bool = False):
     """
     @brief 取**进程内唯一的** `DmCanContext`（设备枚举与所有会话共用）。
@@ -180,12 +251,20 @@ def get_context(refresh: bool = False):
         return _context
     dmcan = load()
     path = resolve_library_path()
+    # 先把同目录的依赖按绝对路径装进进程，避免被 PATH 里的同名 DLL 顶掉（见 preload_dependencies）
+    preload_dependencies(path)
     try:
         _context = dmcan.DmCanContext(path) if path else dmcan.DmCanContext()
     except Exception as ex:
         where = path or '（自动查找：包内 dlls/ -> 系统路径）'
-        raise SdkUnavailable('libdmcan 原生库加载失败（%s）：%s: %s'
-                             % (where, type(ex).__name__, ex)) from ex
+        detail = ''
+        if sys.platform == 'win32':
+            detail = ('\n    WinError 127/126 多半是依赖 DLL 的问题——'
+                      '需要的 4 个 DLL 必须与 libdmcan 同目录且版本配套，'
+                      '而 PATH 里其它软件（ST-Link/QEMU/MSYS2/OpenOCD 等）的同名 DLL 会干扰解析。'
+                      '\n    当前依赖解析：\n    %s' % dependency_report())
+        raise SdkUnavailable('libdmcan 原生库加载失败（%s）：%s: %s%s'
+                             % (where, type(ex).__name__, ex, detail)) from ex
     # SDK 自己的终端日志默认是 info，会把 USB 细节刷到 stdout；这里默认压到 warn。
     # 用户显式设了 DMCAN_LOG_LEVEL 就尊重用户（C 侧初始化时已经读过它）。
     if not os.environ.get('DMCAN_LOG_LEVEL'):
