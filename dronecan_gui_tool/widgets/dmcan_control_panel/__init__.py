@@ -7,59 +7,83 @@
 dmcan 适配器控制面板：位定时、实时统计（含丢帧细分）、回环自检。
 
 上游的 `CAN Adapter Control Panel` 是 SLCAN CLI 专用的，对 USB 后端没有意义；
-本面板提供的是 dmcan 后端真正需要的东西：
+本面板提供 dmcan 后端真正需要的东西：
 
 * **设备与固件身份**（型号 / 序列号 / 固件版本 + 构建标识）——判"固件够不够新"看构建标识；
-* **位定时**：仲裁段 / 数据段、是否 CAN FD、采样点、模式；应用只改运行期，落盘要点"存入闪存"；
+* **位定时**：仲裁段 / 数据段、是否 CAN FD；应用只改运行期，落盘要点"存入闪存"；
 * **1 Hz 实时统计**：设备侧累计与每秒增量，并把 `rx_dropped` / `tx_dropped` 拆到具体原因
   （队列满 = 主机读得不够快；内部资源 = 设备侧；无额度/提交失败 = 总线或 MCAN 侧）；
-* **主机侧收帧丢弃**：本进程的收帧队列溢出次数，这是"GUI 卡住丢帧"的直接证据；
-* **外部回环自检**：不接线、单模块自发自收，直接给出丢帧数与往返延迟——用来证明链路本身不丢帧。
+* **主机侧收帧丢弃**：本进程收帧队列溢出次数，这是"GUI 卡住丢帧"的直接证据；
+* **外部回环自检**：不接线、单模块自发自收，直接给出丢帧数与往返延迟。
+
+界面取舍（都是为了让数字**一眼能读**）：正文用系统 UI 字体、只有数值列用等宽字体；
+身份信息按"标签 / 值"两列对齐；统计按 接收 / 发送 / 主机侧 / 总线 分区，数字右对齐、
+丢帧非零标红；顶部一行大字给"每秒收/发/丢"。
 """
 
 from __future__ import annotations
 
 import logging
 import threading
-import time
-from typing import Any, Callable, Optional
+from typing import Any, Callable, List, Optional, Tuple
 
 from PyQt6.QtCore import Qt, QObject, QTimer, pyqtSignal
-from PyQt6.QtWidgets import (QCheckBox, QComboBox, QGridLayout, QGroupBox, QHBoxLayout,
-                             QLabel, QMessageBox, QPushButton, QTableWidget, QTableWidgetItem,
-                             QVBoxLayout, QWidget)
+from PyQt6.QtGui import QBrush, QColor, QFont
+from PyQt6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QFormLayout, QFrame,
+                             QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel,
+                             QMessageBox, QPushButton, QSizePolicy, QTableWidget,
+                             QTableWidgetItem, QVBoxLayout, QWidget)
 
-from .. import get_monospace_font, show_error
+from .. import get_monospace_font, show_error, theme
 
 logger = logging.getLogger(__name__)
 
-__all__ = ['spawn_window', 'DmCanControlPanel']
+__all__ = ['spawn_window', 'DmCanControlPanel', 'STAT_SECTIONS']
 
 #: 常见仲裁段位速率（bps）。
 COMMON_BITRATES = (100000, 125000, 250000, 500000, 800000, 1000000)
 #: 常见数据段位速率（bps），仅 CAN FD 用。
 COMMON_DATA_BITRATES = (500000, 1000000, 2000000, 4000000, 5000000, 8000000)
 
-#: 统计表：(标签, ChannelStats 字段名, 是否显示每秒速率, 提示)
-STAT_ROWS = (
-    ('设备侧 收帧', 'rx_received', True, '总线收到的帧（累计）'),
-    ('设备侧 收帧丢弃', 'rx_dropped', True, '合计；细看下面两行'),
-    ('  其中 接收队列满', 'rx_dropped_queue', True, '主机读得不够快（USB 侧积压）'),
-    ('  其中 设备内部资源', 'rx_dropped_msgc', True, '帧写不进设备内部缓冲'),
-    ('设备侧 发帧受理', 'tx_admitted', True, '上位机提交给设备的帧'),
-    ('设备侧 发帧完成', 'tx_completed', True, '真正发到总线上的帧'),
-    ('设备侧 发帧丢弃', 'tx_dropped', True, '合计；细看下面四行'),
-    ('  其中 无发送额度', 'tx_dropped_no_credit', True, '到达时额度耗尽'),
-    ('  其中 发送队列满', 'tx_dropped_queue_full', True, '设备软件队列满'),
-    ('  其中 提交 MCAN 失败', 'tx_dropped_submit_fail', True, '写 MCAN 发送 FIFO 失败'),
-    ('  其中 通道已关闭', 'tx_dropped_ch_disabled', True, '被关通道/看门狗咬了'),
-    ('设备侧 发帧失败', 'tx_failed', True, '总线错误导致失败'),
-    ('软件发送队列水位', 'sw_tx_fifo_level', False, '设备侧排队深度'),
-    ('硬件发送 FIFO 水位', 'hw_tx_fifo_level', False, 'MCAN 侧排队深度'),
-    ('主机侧 收帧', 'host_rx', True, 'SDK 回调交给本进程的帧'),
-    ('主机侧 发帧', 'host_tx', True, '本进程发出的帧'),
-    ('主机侧 收帧丢弃', 'host_rx_dropped', True, '本进程队列满（GUI 卡住时才会出现）'),
+#: 统计表：(分区, 标签, ChannelStats 字段名, 是否显示每秒速率, 说明)
+STAT_SECTIONS: Tuple[Tuple[str, Tuple[Tuple[str, str, bool, str], ...]], ...] = (
+    ('接收（设备侧）', (
+        ('总线收帧', 'rx_received', True, '适配器从总线上收到的帧（累计值）'),
+        ('收帧丢弃', 'rx_dropped', True, '合计；下面两行是细分原因'),
+        ('　└ 接收队列满', 'rx_dropped_queue', True, '主机读得不够快（USB 侧积压）'),
+        ('　└ 设备内部资源', 'rx_dropped_msgc', True, '帧写不进设备内部缓冲'),
+    )),
+    ('发送（设备侧）', (
+        ('受理', 'tx_admitted', True, '上位机提交给设备的帧'),
+        ('完成', 'tx_completed', True, '真正发到总线上的帧'),
+        ('丢弃', 'tx_dropped', True, '合计；下面四行是细分原因'),
+        ('　└ 无发送额度', 'tx_dropped_no_credit', True, '到达时额度耗尽'),
+        ('　└ 发送队列满', 'tx_dropped_queue_full', True, '设备软件队列满'),
+        ('　└ 提交 MCAN 失败', 'tx_dropped_submit_fail', True, '写 MCAN 发送 FIFO 失败'),
+        ('　└ 通道已关闭', 'tx_dropped_ch_disabled', True, '被关通道/看门狗咬了'),
+        ('失败', 'tx_failed', True, '总线错误导致的发送失败'),
+        ('软件队列水位', 'sw_tx_fifo_level', False, '设备侧排队深度'),
+        ('硬件 FIFO 水位', 'hw_tx_fifo_level', False, 'MCAN 侧排队深度'),
+    )),
+    ('主机侧（本进程）', (
+        ('收帧', 'host_rx', True, 'SDK 回调交给本进程的帧'),
+        ('发帧', 'host_tx', True, '本进程发出的帧'),
+        ('收帧丢弃', 'host_rx_dropped', True, '本进程队列满——GUI 卡住时才会出现'),
+    )),
 )
+
+#: 需要"非零就标红"的字段（丢帧类）。
+DROP_FIELDS = ('rx_dropped', 'rx_dropped_queue', 'rx_dropped_msgc', 'tx_dropped',
+               'tx_dropped_no_credit', 'tx_dropped_queue_full', 'tx_dropped_submit_fail',
+               'tx_dropped_ch_disabled', 'tx_failed', 'host_rx_dropped')
+
+def _semantic(name: str) -> str:
+    """
+    @brief 取语义色的十六进制串（富文本用），已按当前主题做过对比度适配。
+
+    @note 不要在这里硬编码颜色：Qt6 跟随系统深色主题时，"深绿/深红/灰"会糊在深色底上。
+    """
+    return theme.semantic(name).name()
 
 
 def _format_rate(value: Optional[float]) -> str:
@@ -67,11 +91,11 @@ def _format_rate(value: Optional[float]) -> str:
     if value is None:
         return '—'
     if abs(value) >= 1000:
-        return '%.1fk/s' % (value / 1000.0)
-    return '%.0f/s' % value
+        return '%.1fk' % (value / 1000.0)
+    return '%.0f' % value
 
 
-def _format_rate_bps(value: int) -> str:
+def _format_bps(value: int) -> str:
     """@brief 位速率格式化。"""
     if not value:
         return '?'
@@ -80,6 +104,15 @@ def _format_rate_bps(value: int) -> str:
     if value % 1000 == 0:
         return '%d kbps' % (value // 1000)
     return '%d bps' % value
+
+
+def _mono_font(point_delta: int = 0, bold: bool = False) -> QFont:
+    """@brief 等宽字体（只给数字列/身份值用，正文用系统 UI 字体更好读）。"""
+    font = get_monospace_font()
+    if point_delta:
+        font.setPointSize(max(7, font.pointSize() + point_delta))
+    font.setBold(bold)
+    return font
 
 
 class _Worker(QObject):
@@ -114,14 +147,14 @@ class DmCanControlPanel(QWidget):
         @param iface_name 接口串
         """
         super(DmCanControlPanel, self).__init__(parent)
-        self.setWindowTitle('dmcan Adapter Control Panel')
+        self.setWindowTitle('dmcan Adapter Control Panel — 达妙 USB2CANFD / USB2FDCANDUAL')
         self._node = node
         self._driver = node.can_driver
         self._iface_name = iface_name
         self._last_stats = None
         self._busy = False
+        self._rows: List[Tuple[int, str]] = []          # (表格行号, ChannelStats 字段名)
 
-        self.setFont(get_monospace_font())
         self._worker = _Worker()
         self._worker.done.connect(self._on_worker_done)
         self._worker.failed.connect(self._on_worker_failed)
@@ -137,108 +170,187 @@ class DmCanControlPanel(QWidget):
 
     # ------------------------------------------------------------------ UI
     def _build_ui(self) -> None:
-        """@brief 搭界面：身份 -> 控制 -> 统计。"""
-        self._identity = QLabel(self)
-        self._identity.setWordWrap(True)
+        """@brief 搭界面：身份 -> 控制 -> 大字汇总 + 分区统计表。"""
+        layout = QVBoxLayout(self)
+        layout.setSpacing(8)
+        layout.addWidget(self._build_identity_box())
+        layout.addWidget(self._build_control_box())
+        layout.addWidget(self._build_stats_box(), 1)
 
-        identity_box = QGroupBox('设备', self)
-        identity_layout = QVBoxLayout()
-        identity_layout.addWidget(self._identity)
-        identity_box.setLayout(identity_layout)
+        note = QLabel('判链路是否丢帧看"外部回环自检"；'
+                      '"接收队列满"说明主机读得不够快，"主机侧收帧丢弃"说明本进程卡住了。', self)
+        note.setStyleSheet('color: %s;' % theme.semantic('muted').name())
+        note.setToolTip('设备侧统计来自固件 1 Hz 周期上报，是**累计值**，表里"每秒"列才是增量。\n'
+                        '丢帧细分只在固件对应记录到达后才有效（drop_flags），刚打开的一两秒内可能显示 0。')
+        layout.addWidget(note)
 
-        control_box = QGroupBox('通道位定时与控制', self)
-        control_layout = QGridLayout()
+        self.resize(1000, 760)
+
+    def _build_identity_box(self) -> QGroupBox:
+        """@brief 设备身份区：标签 / 值两列对齐，值用等宽字体。"""
+        box = QGroupBox('设备', self)
+        form = QFormLayout()
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        form.setFormAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        form.setHorizontalSpacing(12)
+        form.setVerticalSpacing(4)
+
+        self._labels = {}
+        for key, caption in (('type', '型号'), ('serial', '序列号'), ('firmware', '固件'),
+                             ('vidpid', 'VID:PID'), ('iface', '接口串'),
+                             ('channel', '通道'), ('config', '位定时')):
+            label = QLabel('—', self)
+            label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            label.setFont(_mono_font())
+            label.setWordWrap(True)
+            form.addRow(QLabel('%s：' % caption, self), label)
+            self._labels[key] = label
+
+        box.setLayout(form)
+        return box
+
+    def _build_control_box(self) -> QGroupBox:
+        """@brief 位定时与控制按钮。"""
+        box = QGroupBox('通道位定时与控制', self)
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(6)
 
         self._bitrate = QComboBox(self)
         self._bitrate.setEditable(True)
         self._bitrate.insertItems(0, [str(x) for x in COMMON_BITRATES])
+        self._bitrate.setToolTip('仲裁段位速率（bps）。只改运行期，掉电不保留。')
+
         self._fd = QCheckBox('CAN FD', self)
         self._fd.stateChanged.connect(self._on_fd_changed)
+        self._fd.setToolTip('勾上才下发 CAN FD；数据段 > 1 Mbps 时 SDK 会自动开 TDC。')
+
         self._data_bitrate = QComboBox(self)
         self._data_bitrate.setEditable(True)
         self._data_bitrate.insertItems(0, [str(x) for x in COMMON_DATA_BITRATES])
         self._data_bitrate.setEnabled(False)
 
-        apply_button = QPushButton('应用位定时（运行期）', self)
-        apply_button.clicked.connect(self._apply_bitrate)
-        save_button = QPushButton('存入设备闪存', self)
-        save_button.clicked.connect(self._save_params)
-        enable_button = QPushButton('使能通道', self)
-        enable_button.clicked.connect(lambda: self._toggle_channel(True))
-        disable_button = QPushButton('关闭通道', self)
-        disable_button.clicked.connect(lambda: self._toggle_channel(False))
-        clear_button = QPushButton('清 bus-off', self)
-        clear_button.clicked.connect(self._clear_bus_off)
-        selftest_button = QPushButton('外部回环自检…', self)
-        selftest_button.clicked.connect(self._self_test)
+        buttons = (
+            ('应用位定时', '把上面的位定时下发给通道（运行期，约 1.2 s 生效）', self._apply_bitrate),
+            ('存入设备闪存', '把当前运行期参数写进设备 Flash（掉电保留）', self._save_params),
+            ('使能通道', '打开通道（关机/复位后通道默认是关的）', lambda: self._toggle_channel(True)),
+            ('关闭通道', '关闭通道，停止收发', lambda: self._toggle_channel(False)),
+            ('清 bus-off', '清掉通道的 bus-off 状态', self._clear_bus_off),
+            ('外部回环自检…', '不接线自发自收，验证整条收发链路（会临时切模式）', self._self_test),
+        )
+        for index, (text, tip, handler) in enumerate(buttons):
+            button = QPushButton(text, self)
+            button.setToolTip(tip)
+            button.clicked.connect(handler)
+            grid.addWidget(button, 1 + index // 3, 2 + index % 3)
 
-        row = 0
-        control_layout.addWidget(QLabel('仲裁段位速率 (bps):'), row, 0)
-        control_layout.addWidget(self._bitrate, row, 1)
-        control_layout.addWidget(self._fd, row, 2)
-        control_layout.addWidget(self._data_bitrate, row, 3)
-        row += 1
-        buttons = QHBoxLayout()
-        for button in (apply_button, save_button, enable_button, disable_button,
-                       clear_button, selftest_button):
-            buttons.addWidget(button)
-        buttons.addStretch(1)
-        control_layout.addLayout(buttons, row, 0, 1, 4)
-        control_box.setLayout(control_layout)
+        grid.addWidget(QLabel('仲裁段 (bps)：', self), 0, 0)
+        grid.addWidget(self._bitrate, 0, 1)
+        grid.addWidget(self._fd, 0, 2)
+        grid.addWidget(QLabel('数据段 (bps)：', self), 0, 3)
+        grid.addWidget(self._data_bitrate, 0, 4)
+        grid.setColumnStretch(5, 1)
 
-        self._summary = QLabel(self)
-        self._summary.setWordWrap(True)
+        box.setLayout(grid)
+        return box
 
-        self._table = QTableWidget(len(STAT_ROWS), 3, self)
+    def _build_stats_box(self) -> QGroupBox:
+        """@brief 大字汇总 + 分区统计表。"""
+        box = QGroupBox('实时统计（设备侧 1 Hz 上报：累计值 + 每秒增量）', self)
+        layout = QVBoxLayout()
+        layout.setSpacing(6)
+
+        self._headline = QLabel('等待数据…', self)
+        self._headline.setTextFormat(Qt.TextFormat.RichText)
+        self._headline.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        layout.addWidget(self._headline)
+
+        separator = QFrame(self)
+        separator.setFrameShape(QFrame.Shape.HLine)
+        separator.setFrameShadow(QFrame.Shadow.Sunken)
+        layout.addWidget(separator)
+
+        rows = sum(len(section[1]) for section in STAT_SECTIONS)
+        self._table = QTableWidget(self)
+        self._table.setColumnCount(3)
         self._table.setHorizontalHeaderLabels(['指标', '累计', '每秒'])
         self._table.verticalHeader().setVisible(False)
-        self._table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self._table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
-        for row_index, (label, _field, _rate, tip) in enumerate(STAT_ROWS):
-            item = QTableWidgetItem(label)
-            item.setToolTip(tip)
-            self._table.setItem(row_index, 0, item)
-            for column in (1, 2):
-                self._table.setItem(row_index, column, QTableWidgetItem('—'))
-        self._table.resizeColumnsToContents()
-        self._table.horizontalHeader().setStretchLastSection(True)
+        self._table.setShowGrid(False)
+        self._table.setAlternatingRowColors(True)
+        self._table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self._table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._table.setWordWrap(False)
+        header = self._table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        header.setDefaultAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        header.setSectionsClickable(False)
 
-        stats_box = QGroupBox('实时统计（设备侧 1 Hz 上报，累计值 + 每秒增量）', self)
-        stats_layout = QVBoxLayout()
-        stats_layout.addWidget(self._summary)
-        stats_layout.addWidget(self._table)
-        stats_box.setLayout(stats_layout)
+        self._table.setRowCount(rows + len(STAT_SECTIONS))
+        row = 0
+        for section_name, entries in STAT_SECTIONS:
+            self._set_section_row(row, section_name)
+            row += 1
+            for caption, field, show_rate, tip in entries:
+                self._set_stat_row(row, caption, field, show_rate, tip)
+                self._rows.append((row, field))
+                row += 1
 
-        note = QLabel('提示：设备侧"收帧丢弃/接收队列满"说明主机读得不够快；'
-                      '"主机侧收帧丢弃"说明本 GUI 进程卡住了。'
-                      '判定链路本身是否丢帧请用"外部回环自检"（不接线）。', self)
-        note.setWordWrap(True)
+        self._table.verticalHeader().setDefaultSectionSize(22)
+        for row_index in range(self._table.rowCount()):
+            if self._table.item(row_index, 1) is None:
+                self._table.setRowHeight(row_index, 26)
 
-        layout = QVBoxLayout(self)
-        layout.addWidget(identity_box)
-        layout.addWidget(control_box)
-        layout.addWidget(stats_box, 1)
-        layout.addWidget(note)
-        self.setLayout(layout)
-        self.resize(760, 620)
+        layout.addWidget(self._table, 1)
+        box.setLayout(layout)
+        return box
+
+    def _set_section_row(self, row: int, name: str) -> None:
+        """@brief 分区标题行（整行合并、浅底、加粗）。"""
+        item = QTableWidgetItem(name)
+        font = self.font()
+        font.setBold(True)
+        item.setFont(font)
+        item.setBackground(QBrush(theme.section_background()))
+        item.setForeground(QBrush(theme.section_foreground()))
+        self._table.setItem(row, 0, item)
+        self._table.setSpan(row, 0, 1, 3)
+
+    def _set_stat_row(self, row: int, caption: str, field: str, show_rate: bool, tip: str) -> None:
+        """@brief 一行统计：标签左对齐、数值右对齐并用等宽字体。"""
+        label = QTableWidgetItem(caption)
+        label.setToolTip(tip)
+        self._table.setItem(row, 0, label)
+
+        for column, initial in ((1, '—'), (2, '—' if show_rate else '')):
+            cell = QTableWidgetItem(initial)
+            cell.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            cell.setFont(_mono_font())
+            cell.setToolTip(tip)
+            self._table.setItem(row, column, cell)
 
     # ------------------------------------------------------------- 身份/配置
     def _load_identity(self) -> None:
         """@brief 读一次设备/固件/通道信息并显示。"""
+        session = self._driver.session
         try:
             info = self._driver.describe()
         except Exception as ex:
-            self._identity.setText('读设备信息失败：%s' % ex)
+            self._labels['type'].setText('读设备信息失败：%s' % ex)
             return
-        text = ('接口 %s\n型号 %s   序列号 %s   VID:PID %04X:%04X\n固件 %s\n当前通道 %s\n主机计数 %s'
-                % (info.get('iface', self._iface_name),
-                   info.get('type_name', '?'), info.get('serial', '?'),
-                   int(info.get('vid', 0)), int(info.get('pid', 0)),
-                   info.get('firmware', '?'), info.get('config', '?'),
-                   info.get('counters', {})))
-        self._identity.setText(text)
 
-        config = getattr(self._driver.session, 'config', None)
+        self._labels['type'].setText(str(info.get('type_name', '?')))
+        self._labels['serial'].setText(str(info.get('serial') or '?'))
+        self._labels['firmware'].setText(str(info.get('firmware', '?')))
+        self._labels['vidpid'].setText('%04X:%04X' % (int(info.get('vid', 0)),
+                                                      int(info.get('pid', 0))))
+        self._labels['iface'].setText(str(info.get('iface', self._iface_name)))
+        self._labels['channel'].setText('CH%d' % session.channel)
+        self._labels['config'].setText(str(info.get('config', '?')))
+
+        config = getattr(session, 'config', None)
         if config is not None:
             self._bitrate.setCurrentText(str(config.nominal))
             self._fd.setChecked(bool(config.canfd))
@@ -256,7 +368,7 @@ class DmCanControlPanel(QWidget):
         if self._busy:
             return
         self._busy = True
-        self._summary.setText('正在执行：%s …' % description)
+        self._headline.setText('<span style="color:#666666;">正在执行：%s …</span>' % description)
         logger.info('dmcan 面板执行：%s', description)
         self._worker.run(function)
 
@@ -289,7 +401,7 @@ class DmCanControlPanel(QWidget):
             show_error('参数错误', '位速率必须是整数', '例如 1000000', self)
             return
         session = self._driver.session
-        self._run_async('应用位定时 %s' % _format_rate_bps(nominal),
+        self._run_async('应用位定时 %s' % _format_bps(nominal),
                         lambda: session.apply_bitrate(nominal, data))
 
     def _save_params(self) -> None:
@@ -339,40 +451,81 @@ class DmCanControlPanel(QWidget):
 
     # ------------------------------------------------------------------ 刷新
     def _refresh(self) -> None:
-        """@brief 1 Hz 刷新统计表（设备侧累计 + 每秒增量）。"""
+        """@brief 1 Hz 刷新统计（设备侧累计 + 每秒增量）。"""
         if self._busy:
             return
         try:
             stats = self._driver.statistics()
         except Exception as ex:
-            self._summary.setText('读统计失败：%s' % ex)
+            self._headline.setText('<span style="color:%s;">读统计失败：%s</span>'
+                                   % (_semantic('bad'), ex))
             return
-        diff = None
-        if self._last_stats is not None:
-            diff = stats.diff(self._last_stats)
+
+        diff = stats.diff(self._last_stats) if self._last_stats is not None else None
         self._last_stats = stats
 
-        for row_index, (_label, field, show_rate, _tip) in enumerate(STAT_ROWS):
-            self._table.item(row_index, 1).setText(str(getattr(stats, field, 0)))
-            if show_rate and diff is not None:
-                self._table.item(row_index, 2).setText(
-                    _format_rate(getattr(diff, field, 0) / diff.seconds if diff.seconds else 0))
-            elif show_rate:
-                self._table.item(row_index, 2).setText('—')
+        for row, field in self._rows:
+            value = int(getattr(stats, field, 0))
+            rate = ''
+            if diff is not None and self._table.item(row, 2).text() != '':
+                rate = _format_rate(getattr(diff, field, 0) / diff.seconds if diff.seconds else 0)
+            elif self._table.item(row, 2).text() != '':
+                rate = '—'
 
+            cumulative_item = self._table.item(row, 1)
+            cumulative_item.setText(str(value))
+            if field in DROP_FIELDS and value:
+                cumulative_item.setForeground(QBrush(theme.semantic('bad')))
+            elif field in DROP_FIELDS:
+                cumulative_item.setForeground(QBrush(theme.semantic('muted')))
+
+            rate_item = self._table.item(row, 2)
+            rate_item.setText(rate)
+            seconds_value = (getattr(diff, field, 0) if diff is not None else 0)
+            if field in DROP_FIELDS and seconds_value:
+                rate_item.setForeground(QBrush(theme.semantic('bad')))
+            else:
+                rate_item.setForeground(QBrush(theme.semantic('muted')))
+
+        self._headline.setText(self._format_headline(stats, diff))
+
+    def _format_headline(self, stats, diff) -> str:
+        """@brief 顶部大字：每秒收/发、丢帧与总线状态。"""
         if stats.pending:
-            self._summary.setText('等待设备的第一条周期上报（1 Hz）…')
-        else:
-            text = ('%s  |  总线 %s  TEC=%d REC=%d  软件发送队列 %d  硬件发送 FIFO %d'
-                    % ('收 %.1f 帧/s 发 %.1f 帧/s' % (diff.rx_fps, diff.tx_fps) if diff
-                       else '收 — 发 —',
-                       stats.bus_state_name, stats.tec, stats.rec,
-                       stats.sw_tx_fifo_level, stats.hw_tx_fifo_level))
-            if diff is not None and (diff.rx_dropped or diff.tx_dropped or diff.host_rx_dropped):
-                text += ('  |  ⚠ 这一秒丢帧：设备收 %d（队列 %d/内部 %d）设备发 %d 主机 %d'
-                         % (diff.rx_dropped, diff.rx_dropped_queue, diff.rx_dropped_msgc,
-                            diff.tx_dropped, diff.host_rx_dropped))
-            self._summary.setText(text)
+            return ('<span style="color:%s; font-size:12pt;">'
+                    '等待设备的第一条周期上报（1 Hz）…</span>' % _semantic('muted'))
+
+        normal_color = theme.text_color().name()
+        muted_color = _semantic('muted')
+
+        def big(text, color=None, size=20):
+            return ('<span style="font-size:%dpt; font-weight:600; color:%s;">%s</span>'
+                    % (size, color or normal_color, text))
+
+        def unit(text):
+            return '<span style="color:%s;">%s</span>' % (muted_color, text)
+
+        dropped = 0
+        detail = ''
+        if diff is not None:
+            dropped = (diff.rx_dropped + diff.tx_dropped + diff.host_rx_dropped)
+            if diff.rx_dropped or diff.tx_dropped or diff.host_rx_dropped:
+                detail = ('　设备收 %d（队列 %d / 内部 %d）· 设备发 %d · 主机 %d'
+                          % (diff.rx_dropped, diff.rx_dropped_queue, diff.rx_dropped_msgc,
+                             diff.tx_dropped, diff.host_rx_dropped))
+
+        rx = _format_rate(diff.rx_fps) if diff is not None else '—'
+        tx = _format_rate(diff.tx_fps) if diff is not None else '—'
+        drop_color = _semantic('bad') if dropped else _semantic('ok')
+
+        return ('%s %s　　%s %s　　%s %s%s<br>'
+                '<span style="color:%s;">总线 %s · TEC %d · REC %d · '
+                '软件队列 %d · 硬件 FIFO %d · 通道%s</span>'
+                % (big(rx), unit('收帧/s'), big(tx), unit('发帧/s'),
+                   big(str(dropped), drop_color), unit('丢帧/s'), detail,
+                   muted_color, stats.bus_state_name, stats.tec, stats.rec,
+                   stats.sw_tx_fifo_level, stats.hw_tx_fifo_level,
+                   '已使能' if stats.enabled else '未使能'))
 
     def closeEvent(self, event) -> None:
         """@brief 关窗停掉刷新定时器。"""

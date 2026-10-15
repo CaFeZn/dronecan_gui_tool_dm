@@ -18,6 +18,8 @@ from logging import getLogger
 import qtawesome
 from functools import partial
 
+from . import theme
+
 
 logger = getLogger(__name__)
 
@@ -630,7 +632,20 @@ class PasswordEdit(QLineEdit):
         self._update_icon()
 
 def get_icon(name):
-    return qtawesome.icon(name)
+    """
+    @brief 取图标。
+
+    @param name qtawesome 的图标名（例如 `fa6s.bus`）
+    @return `QIcon`
+
+    @note 本 fork：qtawesome 默认画**黑色**图标，深色主题下菜单/工具栏会看不见，
+          这里统一用主题前景色；取不到时退回 qtawesome 默认行为。
+    """
+    try:
+        return qtawesome.icon(name, color=theme.icon_color().name())
+    except Exception:
+        logger.warning('Could not load icon %r', name, exc_info=True)
+        return QIcon()
 
 
 def make_icon_button(icon_name, tool_tip, parent, checkable=False, checked=False, on_clicked=None, text=''):
@@ -656,7 +671,9 @@ def map_7bit_to_color(value):
 
     col = QColor()
     col.setRgb(0xFF - red, 0xFF - green, 0xFF - blue)
-    return col
+    # 本 fork：上面这套颜色是按**白底**设计的（RGB 取反）。Qt6 跟随系统深色主题时，
+    # 其中一半取值会变成暗色、压在深色底上根本看不清；这里统一做对比度适配（保留色相）。
+    return theme.ensure_contrast(col)
 
 
 def get_monospace_font():

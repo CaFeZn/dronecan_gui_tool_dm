@@ -268,7 +268,80 @@ dronecan-gui-tool-dm/
 
 ---
 
-## 9. 与上游的关系
+## 9. 深色主题（Qt 6.5+ 跟随系统主题）
+
+Qt6 会跟随 Windows 的深色模式：Fusion 深色调色板的表格底色是 `#2d2d2d`。
+上游 gui_tool 里若干**文本颜色是按白底硬编码**的，落到深色底上就变成"深底深字"：
+
+| 位置 | 原算法 | 深色下的对比度 |
+| --- | --- | --- |
+| Data Hex / Data ASCII（`colorize_transfer_id`） | `255-25k` → 白…(80,80,80) | **1.70 : 1** |
+| Local Time（`TimestampRenderer`） | `255-192·Δt` → 空闲 ≥1 s 变 (63,63,63) | **1.30 : 1** |
+| Src / Dst / Data Type（`map_7bit_to_color`） | RGB 取反 | 4.6 : 1（勉强） |
+| 菜单 / 工具栏图标（qtawesome） | 默认黑色 | 基本看不见 |
+
+实测一张深色截图：**表格区 73.5% 的文字像素对比度 < 3:1**（WCAG AA 要求正文 ≥ 4.5:1）。
+
+修复：新增 [`dronecan_gui_tool/widgets/theme.py`](dronecan_gui_tool/widgets/theme.py)，
+所有"按语义生成颜色"的入口统一走它——**保留色相**，只把亮度夹到与当前背景对比度达标
+（正文 4.5:1、次要信息 3:1）的范围；图标颜色跟随调色板前景色；分区块底色改成
+"与背景轻微区分"。修复后同一张渲染的低对比度像素降到 **2.0%**，颜色探针全部 ≥ 5 : 1。
+
+复现与回归：
+
+```bash
+python tests/bus_monitor_render.py --theme dark     # 渲染深色版并打印对比度统计
+python tests/bus_monitor_render.py --measure <png> --crop X,Y,W,H   # 量一张已有截图
+python -m unittest tests.test_theme -v              # 128 个计算色 + 32 个优先级 + 时间戳淡出…
+```
+
+---
+
+## 10. 压力测试：GUI 开着会不会丢帧
+
+[`tests/gui_stress.py`](tests/gui_stress.py) 全程走**真实硬件 + 真实协议栈**：
+
+1. 按 gui_tool 的方式建 dmcan 节点并起主窗口（可选再开 Bus Monitor / DM 面板）；
+2. 把通道切到**外部回环**——自己发的帧真的上总线、又回到自己（不依赖对端 ACK）；
+3. 后台线程按目标速率灌**真实 DroneCAN 广播帧**（帧预编码，否则限制速率的是 Python 的
+   DSDL 编码开销而不是链路；Windows 上也不能靠 `sleep(1/rate)` 定速，会卡在睡眠粒度上）；
+4. 每档结束**等到积压排空**（判据是"未解码条数不再下降"，而不是固定等 2 s）再统计。
+
+实测（USB2CANFD_Dual，CH1，经典 CAN 1 Mbps，固件 V2.0.0 [b5c2574]）：
+
+| 目标速率 | 实发 | 解码回 | 设备侧丢帧 | 主机侧丢帧 | 收帧队列峰值 |
+| --- | --- | --- | --- | --- | --- |
+| 1 000 帧/s | 4 844 | 4 849 | 0 | 0 | 20 |
+| 5 000 帧/s | 24 999 | 25 004 | 0 | 0 | 110 |
+| 10 000 帧/s | 50 085 | 49 711 | 0（个别轮次 17） | 0 | 155 |
+| 20 000 帧/s | 76 428 | 76 440 | 0 | 0 | 181 |
+| 10 000 帧/s + Bus Monitor + DM 面板 | 39 619 | 39 625 | 0 | 0 | 149 |
+
+**结论：GUI 开着（含 Bus Monitor 与适配器面板）零丢帧。** 即使把一条 1 Mbps 经典 CAN
+灌到接近饱和（物理上限约 9 000 帧/s），主机侧收帧队列峰值也不到 200 帧——驱动给的是
+131 072 帧的余量。
+
+两点说明：
+
+* 速率上限在**总线**而不在主机：灌到 10 000 帧/s 以上时设备侧偶发 `rx_dropped`，
+  那是总线塞满（判据：`rx_dropped_queue` 始终为 0，即**主机从来没有读不过来**）。
+* 顺手修了上游 Bus Monitor 的一个遗留问题：它每 100 ms 只取 1 帧，总线快于 ~10 帧/s 时
+  IPC 待处理会**无限增长**（实测 6 秒涨到 65 000 条）。现在队列封顶 20 000 条并丢最旧的，
+  长时间开着不会再涨内存。
+
+用法：
+
+```bash
+python tests/gui_stress.py --rates 1000,5000,10000 --seconds 5
+python tests/gui_stress.py --rates 10000 --seconds 6 --monitor --panel
+```
+
+> `--iface` 默认 `dmcan:0.1`（另一路）。**不要**拿接了真实总线的通道做回环测试：
+> 外部回环会把测试帧真的发到那条总线上。
+
+---
+
+## 11. 与上游的关系
 
 * 上游改动只落在两处（都在文件里标了注释）：`main.py` 的 `make_node` 分发 + 面板选择、
   `setup_window.py` 的接口列表追加。其余上游文件原封不动，方便 `git merge upstream/master`。

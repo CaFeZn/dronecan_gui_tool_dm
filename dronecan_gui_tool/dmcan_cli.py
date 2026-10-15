@@ -161,6 +161,55 @@ def cmd_info(args) -> int:
     return 0
 
 
+def _display_width(text: str) -> int:
+    """@brief 终端显示宽度（中日韩字符算 2 列）。"""
+    return sum(2 if ord(char) > 0x2E80 else 1 for char in str(text))
+
+
+def _pad(text: str, width: int, align: str = 'right') -> str:
+    """@brief 按**显示宽度**对齐（不然中文表头会和数字行错开）。"""
+    text = str(text)
+    padding = ' ' * max(0, width - _display_width(text))
+    return (padding + text) if align == 'right' else (text + padding)
+
+
+#: monitor 表的列：标题 -> 显示宽度 -> 对齐
+MONITOR_COLUMNS = (
+    ('时间', 8, 'right'),
+    ('收帧/s', 9, 'right'),
+    ('发帧/s', 9, 'right'),
+    ('丢帧(收)', 9, 'right'),
+    ('队列/内部', 10, 'right'),
+    ('丢帧(发)', 9, 'right'),
+    ('主机丢', 8, 'right'),
+    ('总线', 8, 'left'),
+    ('TEC', 4, 'right'),
+    ('REC', 4, 'right'),
+)
+
+
+def _monitor_header() -> str:
+    """@brief 表头（外加一行说明，中文宽度按显示宽度对齐）。"""
+    return ' '.join(_pad(title, width, align) for title, width, align in MONITOR_COLUMNS)
+
+
+def _monitor_row(elapsed: float, diff, stats, marker: str = '') -> str:
+    """@brief 一行统计：1 s 的增量 + 当前总量/状态。"""
+    cells = (
+        ('%.1fs' % elapsed, 8, 'right'),
+        ('%.1f' % diff.rx_fps, 9, 'right'),
+        ('%.1f' % diff.tx_fps, 9, 'right'),
+        ('%d' % diff.rx_dropped, 9, 'right'),
+        ('%d/%d' % (diff.rx_dropped_queue, diff.rx_dropped_msgc), 10, 'right'),
+        ('%d' % diff.tx_dropped, 9, 'right'),
+        ('%d' % diff.host_rx_dropped, 8, 'right'),
+        (stats.bus_state_name, 8, 'left'),
+        ('%d' % stats.tec, 4, 'right'),
+        ('%d' % stats.rec, 4, 'right'),
+    )
+    return ' '.join(_pad(text, width, align) for text, width, align in cells) + marker
+
+
 def cmd_monitor(args) -> int:
     """@brief 每秒打印统计增量，结束时给结论。"""
     session = DmCanSession(args.iface, default_bitrate=args.bitrate,
@@ -171,8 +220,13 @@ def cmd_monitor(args) -> int:
         print('打开失败：%s' % ex, file=sys.stderr)
         return 2
 
-    print('监听 %s（%s）；Ctrl-C 结束' % (session.description,
-                                          session.config.describe() if session.config else ''))
+    print('监听 %s' % session.description)
+    print('      %s' % (session.config.describe() if session.config else ''))
+    print('列含义：丢帧(收)=设备侧接收丢弃（队列/内部 是它的细分原因）· 丢帧(发)=设备侧发送丢弃 · '
+          '主机丢=本进程队列丢弃；单位都是帧/秒。Ctrl-C 结束。')
+    print('')
+    print(_monitor_header())
+    print('-' * _display_width(_monitor_header()))
     started = time.monotonic()
     previous: Optional[ChannelStats] = None
     totals = {'rx': 0, 'rx_dropped': 0, 'rx_dropped_queue': 0, 'rx_dropped_msgc': 0,
@@ -188,6 +242,7 @@ def cmd_monitor(args) -> int:
                 previous = snapshot
             time.sleep(0.2)
         last_print = time.monotonic()
+        rows = 0
     except KeyboardInterrupt:
         session.close()
         print('已中断。')
@@ -208,13 +263,12 @@ def cmd_monitor(args) -> int:
                 totals['tx_dropped'] += diff.tx_dropped
                 totals['host_dropped'] += diff.host_rx_dropped
                 last_print = now
-                print('[%6.1fs] 收 %8.1f 帧/s  发 %7.1f 帧/s | 设备丢帧 收 %d（队列 %d / 内部 %d）'
-                      ' 发 %d | 主机丢帧 %d | 总线 %s TEC=%d REC=%d | 队列 sw=%d hw=%d%s'
-                      % (now - started, diff.rx_fps, diff.tx_fps, diff.rx_dropped,
-                         diff.rx_dropped_queue, diff.rx_dropped_msgc, diff.tx_dropped,
-                         diff.host_rx_dropped, stats.bus_state_name, stats.tec, stats.rec,
-                         stats.sw_tx_fifo_level, stats.hw_tx_fifo_level,
-                         '' if stats.detail_valid else '  (丢帧细分尚未上报)'))
+                rows += 1
+                if rows % 20 == 0:      # 长跑时隔一段重打表头，翻屏后还能对上列
+                    print('-' * _display_width(_monitor_header()))
+                dropped_now = diff.rx_dropped + diff.tx_dropped + diff.host_rx_dropped
+                marker = '   ⚠ 本秒丢帧' if dropped_now else ''
+                print(_monitor_row(now - started, diff, stats, marker))
             if previous is None or now - last_print >= args.interval:
                 previous = stats
             time.sleep(0.2)

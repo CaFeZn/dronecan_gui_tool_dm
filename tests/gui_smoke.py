@@ -31,14 +31,26 @@ def dump_panel(panel) -> None:
     """@brief 把面板里真正渲染出来的文本打出来（比看截图更可靠，也能进 CI 日志）。"""
     print('[smoke] ---- 面板内容 ----')
     print('[smoke] 设备信息：')
-    for line in panel._identity.text().splitlines():
-        print('[smoke]   %s' % line)
-    print('[smoke] 汇总：%s' % panel._summary.text())
+    for key, label in getattr(panel, '_labels', {}).items():
+        print('[smoke]   %-9s %s' % (key, label.text()))
+    headline = getattr(panel, '_headline', None)
+    if headline is not None:
+        plain = headline.text().replace('<br>', ' / ')
+        while '<' in plain and '>' in plain:      # 粗暴去掉富文本标签，只为日志可读
+            start, end = plain.find('<'), plain.find('>')
+            if start < 0 or end < start:
+                break
+            plain = plain[:start] + plain[end + 1:]
+        print('[smoke] 大字汇总：%s' % plain)
     print('[smoke] 统计表：')
     for row in range(panel._table.rowCount()):
-        cells = [panel._table.item(row, column).text()
-                 for column in range(panel._table.columnCount())]
-        print('[smoke]   %-22s %10s %10s' % tuple(cells))
+        cells = []
+        for column in range(panel._table.columnCount()):
+            item = panel._table.item(row, column)
+            cells.append(item.text() if item is not None else '')
+        if not any(cells):
+            continue
+        print('[smoke]   %-24s %12s %10s' % tuple(cells))
     print('[smoke] ---- 面板内容结束 ----')
 
 
@@ -48,6 +60,8 @@ def main() -> int:
     parser.add_argument('iface', nargs='?', default='dmcan:0.0', help='接口串')
     parser.add_argument('--mock', action='store_true', help='用仿真 dmcan SDK（不需要硬件）')
     parser.add_argument('--seconds', type=float, default=3.0, help='事件循环时长')
+    parser.add_argument('--theme', choices=('light', 'dark', 'system'), default='system',
+                        help='强制浅色/深色调色板（默认跟随系统）')
     args = parser.parse_args()
 
     if args.mock:
@@ -75,6 +89,11 @@ def main() -> int:
 
     app = QApplication(['dronecan_gui_tool'])
     app.setStyle('Fusion')
+    if args.theme != 'system':
+        from tests.theme_palettes import apply_palette
+        apply_palette(args.theme == 'dark')
+        from dronecan_gui_tool.widgets import theme
+        print('[smoke] 调色板：%s（表底 %s）' % (args.theme, theme.background_color().name()))
 
     iface_kwargs = dict(baudrate=gui.args.baudrate, bitrate=gui.args.bitrate,
                         bus_number=gui.args.bus, filtered=bool(gui.args.filtered),

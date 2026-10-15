@@ -86,6 +86,49 @@ class VerdictTest(unittest.TestCase):
         self.assertIn('发帧被丢', text)
 
 
+class MonitorTableTest(unittest.TestCase):
+    """monitor 的表：列宽必须对齐（中文表头也按显示宽度算）。"""
+
+    def _fake(self, **kwargs):
+        from dronecan_gui_tool.driver.dmcan_session import ChannelStats, StatsDiff
+        diff = StatsDiff(seconds=1.0, **kwargs)
+        stats = ChannelStats(ok=True, enabled=True)
+        return diff, stats
+
+    def test_header_row_width_matches(self):
+        """每一行的显示宽度都与表头一致，终端里才不会错列。"""
+        header = dmcan_cli._monitor_header()
+        expected = dmcan_cli._display_width(header)
+        for killer in ({}, {'rx_dropped': 3, 'rx_dropped_queue': 3}, {'host_rx_dropped': 1},
+                       {'tx_dropped': 2, 'rx_dropped': 5, 'host_rx_dropped': 9}):
+            diff, stats = self._fake(**killer)
+            diff.rx_received = 12345
+            diff.tx_completed = 678
+            row = dmcan_cli._monitor_row(12.3, diff, stats)
+            with self.subTest(drops=killer):
+                self.assertEqual(dmcan_cli._display_width(row), expected)
+
+    def test_drop_marker(self):
+        """丢帧的那一秒要显眼地标出来。"""
+        diff, stats = self._fake(rx_dropped=2, rx_dropped_queue=2)
+        self.assertIn('⚠', dmcan_cli._monitor_row(1.0, diff, stats, '   ⚠ 本秒丢帧'))
+        diff_ok, stats_ok = self._fake()
+        self.assertNotIn('⚠', dmcan_cli._monitor_row(1.0, diff_ok, stats_ok))
+
+    def test_display_width_counts_cjk_as_two(self):
+        """中日韩字符按 2 列计（否则中文表头会和数字行错开）。"""
+        self.assertEqual(dmcan_cli._display_width('时间'), 4)
+        self.assertEqual(dmcan_cli._display_width('ab'), 2)
+        # 丢(2)+帧(2)+((1)+收(2)+)(1) = 8
+        self.assertEqual(dmcan_cli._display_width('丢帧(收)'), 8)
+
+    def test_pad(self):
+        """补齐后的显示宽度就是目标宽度。"""
+        self.assertEqual(dmcan_cli._display_width(dmcan_cli._pad('收帧/s', 9)), 9)
+        self.assertEqual(dmcan_cli._pad('7', 3), '  7')
+        self.assertEqual(dmcan_cli._pad('7', 3, 'left'), '7  ')
+
+
 class MissingSdkCliTest(unittest.TestCase):
     """没装 dmsdk 时 CLI 要给可照做的提示，而不是崩掉。"""
 

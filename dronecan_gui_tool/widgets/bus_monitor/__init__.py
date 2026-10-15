@@ -30,16 +30,39 @@ class IPCChannel:
     """
     This class is built as an abstraction over the underlying IPC communication channel.
     """
+
+    #: 待处理上限（帧）。监视器进程每 100 ms 只取 1 帧（见 `get_frame`），所以只要总线快于
+    #: ~10 帧/s，这个队列就会一直涨：实测 6 秒灌 4 万帧时涨到 6.5 万条待处理（几十 MB，
+    #: 长时间开着只增不减）。这里封顶，满了**丢最旧的一条**——监视器要看的是"最近的总线"，
+    #: 卡在几分钟前的帧没有意义；丢帧数与原因在 dmcan 面板/CLI 里另有精确统计。
+    MAX_PENDING = 20000
+
     def __init__(self):
-        # Queue is slower than pipe, but it allows to implement non-blocking sending easier,
-        # and the buffer can be arbitrarily large.
-        self._q = multiprocessing.Queue()
+        # Queue is slower than pipe, but it allows to implement non-blocking sending easier.
+        self._q = multiprocessing.Queue(self.MAX_PENDING)
+        self._dropped = 0
+
+    @property
+    def dropped(self):
+        """@brief 因队列满被丢弃的帧数（监视器显示的是最近的总线，不是全量）。"""
+        return self._dropped
 
     def send_nonblocking(self, obj):
         try:
             self._q.put_nowait(obj)
+            return
         except queue.Full:
             pass
+        # 满了：丢掉最旧的一条再塞新的，保证显示跟着总线走而不是越落越远
+        try:
+            self._q.get_nowait()
+            self._q.put_nowait(obj)
+        except (queue.Empty, queue.Full):
+            pass
+        self._dropped += 1
+        if self._dropped % 5000 == 1:
+            logger.warning('Bus Monitor 处理不过来，已丢弃 %d 帧（每 100 ms 只刷新一次，'
+                           '属上游设计；精确丢帧统计请看 dmcan 适配器面板）', self._dropped)
 
     def receive_nonblocking(self):
         """Returns: (True, object) if successful, (False, None) if no data to read """

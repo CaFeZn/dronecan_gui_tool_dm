@@ -18,6 +18,7 @@ from PyQt6.QtGui import QColor, QIcon, QTextOption, QAction
 from PyQt6.QtCore import Qt, QTimer
 from pyqtgraph import PlotWidget, mkPen
 from logging import getLogger
+from .. import theme
 from .. import BasicTable, map_7bit_to_color, RealtimeLogWidget, get_monospace_font, get_icon, flash, get_app_icon, \
     show_error
 from .transfer_decoder import decode_transfer_from_frame
@@ -80,7 +81,8 @@ def colorize_can_id(frame):
     priority = (frame.id >> 24) & mask
     col = QColor()
     col.setRgb(0xFF, 0xFF - (mask - priority) * 6, 0xFF)
-    return col
+    # 本 fork：优先级 → 浅粉色，是按白底设计的；深色主题下做对比度适配
+    return theme.ensure_contrast(col)
 
 
 def colorize_transfer_id(frame):
@@ -95,7 +97,9 @@ def colorize_transfer_id(frame):
 
     col = QColor()
     col.setRgb(0xFF - red, 0xFF - green, 0xFF - blue)
-    return col
+    # 本 fork：这套"数据分组色"最深会到 (80,80,80)，在深色主题下基本看不见；
+    # 保留色相、按当前背景做对比度适配
+    return theme.ensure_contrast(col)
 
 
 def formatted_data(frame):
@@ -128,18 +132,25 @@ class TimestampRenderer:
     def __init__(self):
         self._prev_ts = 0
 
+    #: 越旧越淡的最大淡出量（0 = 不淡出，1 = 与背景同色）
+    MAX_FADE = 0.7
+    #: 时间戳是次要信息，对比度下限放宽到 3:1（正文是 4.5:1）
+    MIN_FADE_CONTRAST = 3.0
+
     def __call__(self, e):
         ts = datetime.datetime.fromtimestamp(e[1].ts_real).strftime(self.FORMAT)
-        col = QColor()
+        background = theme.background_color()
 
         # Constraining delta to [0, 1]
         delta = min(1, e[1].ts_real - self._prev_ts)
         if delta < 0:
-            col.setRgb(255, 230, 230)
-        else:
-            self._prev_ts = e[1].ts_real
-            col.setRgb(*([255 - int(192 * delta)] * 3))
-        return ts, col
+            # 时间倒流（时钟跳变）：用警告色；上游那种浅粉在白底上就难看清
+            return ts, theme.semantic('warn', background)
+        self._prev_ts = e[1].ts_real
+        # 本 fork：原实现是"从白色往黑色插值"，深色主题下空闲 ≥1 s 的行会变成
+        # (63,63,63) 压在 #2D2D2D 上彻底看不清。改成**朝背景淡出**，并保证淡出后仍可读。
+        faded = theme.blend(theme.text_color(), background, delta * self.MAX_FADE)
+        return ts, theme.ensure_contrast(faded, background, self.MIN_FADE_CONTRAST)
 
     @staticmethod
     def compute_timestamp_difference(earlier, later):
