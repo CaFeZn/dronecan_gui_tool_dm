@@ -85,6 +85,9 @@ from PyQt6.QtCore import QTimer, Qt, QUrl
 
 from .setup_window import run_setup_window
 from .active_data_type_detector import ActiveDataTypeDetector
+# 本 fork 新增：dmcan（达妙 USB2CANFD/USB2FDCANDUAL 原生 USB）后端。
+# 没装 dmsdk 时它退化成"什么都不做"，其余后端仍原样交给 pydronecan。
+from .driver import make_node as make_extended_node, is_dmcan_driver
 
 from .widgets import show_error, get_icon, get_app_icon
 from .widgets.node_monitor import NodeMonitorWidget
@@ -262,7 +265,13 @@ class MainWindow(QMainWindow):
 
     def _try_spawn_can_adapter_control_panel(self):
         try:
-            spawn_can_adapter_control_panel(self, self._node, self._iface_name)
+            if is_dmcan_driver(self._node):
+                # dmcan 后端有自己的一套（位定时/统计/丢帧细分/回环自检），
+                # 上游那个面板是 SLCAN CLI 专用的，对它没有意义。
+                from .widgets.dmcan_control_panel import spawn_window as spawn_dmcan_control_panel
+                spawn_dmcan_control_panel(self, self._node, self._iface_name)
+            else:
+                spawn_can_adapter_control_panel(self, self._node, self._iface_name)
         except Exception as ex:
             show_error('CAN Adapter Control Panel error', 'Could not spawn CAN Adapter Control Panel', ex, self)
 
@@ -641,10 +650,10 @@ def main():
             node_info.software_version.major = __version__[0]
             node_info.software_version.minor = __version__[1]
 
-            node = dronecan.make_node(iface,
-                                    node_info=node_info,
-                                    mode=dronecan.uavcan.protocol.NodeStatus().MODE_OPERATIONAL,
-                                    **iface_kwargs)
+            node = make_extended_node(iface,
+                                      node_info=node_info,
+                                      mode=dronecan.uavcan.protocol.NodeStatus().MODE_OPERATIONAL,
+                                      **iface_kwargs)
 
             if iface_kwargs["filtered"]:
                 setup_filtering(node)

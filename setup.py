@@ -58,11 +58,19 @@ args = dict(
         'pyqtgraph',
         'intelhex'
     ],
+    # 本 fork 新增：dmcan 后端是**可选**依赖，放 extras 里；不装也能跑上游所有后端。
+    extras_require={
+        'dmcan': ['dmcan_sdk>=2.1.0'],
+    },
     # We can't use "scripts" here, because generated shims don't work with multiprocessing pickler.
     entry_points={
         'gui_scripts': [
             '{0}={0}.main:main'.format(PACKAGE_NAME),
-        ]
+        ],
+        # 本 fork 新增：无界面 CLI（doctor / list / info / monitor / selftest）
+        'console_scripts': [
+            'dmcan-dronecan-tool={0}.dmcan_cli:main'.format(PACKAGE_NAME),
+        ],
     },
     include_package_data=True,
 

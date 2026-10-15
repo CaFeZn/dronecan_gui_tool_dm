@@ -66,6 +66,24 @@ def _mavcan_interfaces():
         return []
     return ['mavcan::14550']
 
+def _add_dmcan_ifaces(out):
+    """
+    把达妙 dmcan（USB2CANFD / USB2FDCANDUAL）**原生 USB** 后端的接口加进列表。
+
+    这一项是本 fork 新增的：SLCAN 走 USB-UART，总线一忙就丢帧；dmcan 直接走 USB 批量
+    端点，实测单向 26 k 帧/s 零丢帧。没装 dmsdk 或没有设备时这里什么都不加，
+    上游（slcan / socketcan / pcan / mcast / mavcan）行为一个字都不变。
+    """
+    try:
+        from .driver import list_optional_ifaces
+        entries = list_optional_ifaces()
+    except Exception as ex:
+        logger.warning('Could not enumerate dmcan interfaces: %s', ex, exc_info=True)
+        return out
+    for description, iface in entries.items():
+        out[description] = iface
+    return out
+
 def list_ifaces():
     """Returns dictionary, where key is description, value is the OS assigned name of the port"""
     logger.debug('Updating iface list...')
@@ -92,6 +110,7 @@ def list_ifaces():
         for x in ifaces:
             out[x] = x
 
+        _add_dmcan_ifaces(out)
         return out
     else:
         # Windows, Mac, whatever
@@ -129,6 +148,7 @@ def list_ifaces():
         except Exception as ex:
             logger.warning('Could not load can interfaces: %s', ex, exc_info=True)
 
+        _add_dmcan_ifaces(out)
         return out
 
 

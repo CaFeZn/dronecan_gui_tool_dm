@@ -65,3 +65,10 @@ target/
 .idea/
 
 venv/
+
+# --- 本 fork 新增 ---
+.venv/
+# 运行期产物（GUI 冒烟测试的截图等）
+artifacts/
+# 原生库 libdmcan 从 dm-device-sdk 按需取（tools/fetch_dmcan_lib.py），二进制不入库
+dlls/

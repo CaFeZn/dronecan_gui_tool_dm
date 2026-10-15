@@ -1,0 +1,25 @@
+# 跑 DroneCAN GUI Tool（本 fork）需要的 Python 包。
+# 上游 setup.py 的 install_requires 已覆盖大部分；这里列成可直接 pip 的清单
+# （Python 3.14 + PyQt6 6.11 实测可用）。
+dronecan>=1.0.25
+pyserial>=3.0
+PyQt6
+pyqtgraph
+qtawesome
+numpy
+qtconsole
+jupyter-client
+ipykernel
+traitlets
+pygments
+qtpy
+pyyaml
+pymavlink
+intelhex
+easywebdav
+python-can
+
+# dmcan 后端是**可选**依赖：不装只是没有 dmcan: 接口，slcan/socketcan/pcan/mcast 照常。
+#   pip install dmcan_sdk
+# 离线安装 SDK 仓库里的 wheel：
+#   pip install <dm-device-sdk>/Python/pack/dmcan_sdk-2.1.1-py3-none-any.whl
