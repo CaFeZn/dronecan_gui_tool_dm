@@ -186,8 +186,7 @@ $ dmcan-dronecan-tool selftest dmcan:0.1@1000000 --count 1000 --rate 500
   * bit timing: arbitration and CAN FD data phase — "Apply" takes effect immediately, "Save to flash" persists;
   * **1 Hz live statistics**: device-side totals and per-second deltas, RX/TX drops broken down by cause,
     plus host-side drops and TX queue depth;
-  * enable / disable channels, clear bus-off;
-  * **one-click external loopback self-test**: 1000 frames without wiring, reporting loss and latency.
+  * enable / disable channels, clear bus-off.
 
 ![Adapter control panel](docs/images/adapter-panel.png)
 
@@ -331,6 +330,10 @@ The build script already handles a few non-obvious things (each commented where 
 ---
 
 ## For developers
+
+> **How the integration works**: [docs/porting-dmsdk.md](docs/porting-dmsdk.md) — layering, how the
+> optional dependency is kept optional, the RX path and SDK timing rules, the exact upstream touch
+> points, the pitfalls we hit, and an 8-step recipe for integrating a different CAN adapter.
 
 ```
 dronecan_gui_tool/
