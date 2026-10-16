@@ -34,9 +34,11 @@ DroneCAN GUI Tool — dmcan 分支（免安装版）
   dmcan-dronecan-tool.exe monitor dmcan:0.0@1000000 --seconds 10
   dmcan-dronecan-tool.exe selftest dmcan:0.1@1000000 --count 2000
 
-深色主题
---------
-界面会跟随 Windows 的深色/浅色模式（Qt6 自动），文本颜色按当前背景做过对比度适配。
+外观（深色 / 浅色）
+-------------------
+菜单 View -> Appearance：Follow System（跟随系统，默认）/ Dark（强制深色）/ Light（强制浅色），
+选择会被记住，下次启动以及 Bus Monitor、Plotter 两个窗口都跟着变，切换立即生效。
+深色模式下表格文字与图标按当前背景做过对比度适配。
 
 来源
 ----

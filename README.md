@@ -15,7 +15,7 @@
 | Connecting a DM adapter | SLCAN only (treated as a USB serial port) | **Native USB** (new `dmcan:` interfaces) |
 | Loaded bus | Serial baud rate + text parsing become the bottleneck | USB bulk endpoints; 20,000 frames/s injected with zero loss |
 | Drop diagnostics | Only "frames are missing" | Device side and host side counted separately, broken down by cause (RX queue full / device resources / no TX credit …) |
-| Adapter panel | SLCAN CLI panel | DM panel: identity, bit timing, 1 Hz statistics, one-click self-test |
+| Adapter panel | SLCAN CLI panel | DM panel: identity, bit timing, 1 Hz live statistics, channel enable/disable |
 | Dark theme | Table text and icons unreadable on dark backgrounds | Fixed (the light theme stays **bit-for-bit identical** to upstream) |
 
 **Without the DM SDK everything still works**: the interface list simply lacks the `dmcan:` entries,
