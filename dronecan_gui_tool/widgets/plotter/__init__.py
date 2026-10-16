@@ -15,6 +15,7 @@ import multiprocessing
 from PyQt6.QtWidgets import QApplication
 from PyQt6.QtCore import QTimer
 from .window import PlotterWindow
+from .. import theme
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +60,8 @@ def _process_entry_point(channel):
 
     # Set the style for Qt6 to be same across systems
     app.setStyle("Fusion")
+    # 跟主窗口用同一套深浅外观（独立进程，读同一份 QSettings）
+    theme.apply_saved_mode(app)
 
     def exit_if_should():
         if RUNNING_ON_WINDOWS:

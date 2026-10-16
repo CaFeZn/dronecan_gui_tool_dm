@@ -72,3 +72,5 @@ venv/
 artifacts/
 # 原生库 libdmcan 从 dm-device-sdk 按需取（tools/fetch_dmcan_lib.py），二进制不入库
 dlls/
+# 打包产物（tools/build_exe.py 生成）
+dist/

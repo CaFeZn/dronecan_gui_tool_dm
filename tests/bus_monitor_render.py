@@ -55,15 +55,22 @@ def make_stream(count: int = 260):
     return frames
 
 
-def _contrast_report(image) -> str:
+def _contrast_report(image, min_ratio: float = 3.0) -> str:
     """
-    @brief 统计一张界面截图里"看不清楚"的文字像素占比。
+    @brief 量"**色块单元格上的文字**"看得清不清。
 
-    做法：先取出现最多的颜色当背景，再算每个像素相对它的 WCAG 对比度；
-    把"既不是背景、也不是抗锯齿中间色"的像素当作文字像素，统计其中对比度 < 3:1 的比例。
-    深色主题适配好不好，这个数能直接看出来（越低越好）。
+    做法：对每个采样像素，取周围一小片区域的**局部众数色**当作这一格的底色：
+
+    * 色块内部 -> 众数就是自己，跳过；
+    * 表格网格线（浅灰线压在白底）-> 众数是表格底色、不是色块，跳过
+      （那是装饰不是文字，算进来只会把数字搅乱）；
+    * **色块上的文字** -> 众数是色块色，量"文字 vs 色块"的对比度——正是要看的东西。
+
+    只跟整表底色比是不行的：色块本身与表格底对比度很高，但**色块上的字**可能糊成一团
+    （现场那版浅色 UI 就是这样：近白的浅色块被压成深色、再压白字）。
 
     @param image `QImage`
+    @param min_ratio 判定"看不清"的对比度阈值
     @return 人读结论
     """
     from collections import Counter
@@ -71,29 +78,65 @@ def _contrast_report(image) -> str:
     from dronecan_gui_tool.widgets.theme import contrast_ratio
 
     width, height = image.width(), image.height()
-    step = max(1, min(width, height) // 400)
+    step = max(1, min(width, height) // 300)
+
     histogram = Counter()
-    pixels = []
+    grid = []
     for y in range(0, height, step):
+        row = []
         for x in range(0, width, step):
             color = image.pixelColor(x, y)
             rgb = (color.red(), color.green(), color.blue())
             histogram[rgb] += 1
-            pixels.append(rgb)
-    background = QColor(*histogram.most_common(1)[0][0])
-    text_pixels = 0
-    bad_pixels = 0
-    for rgb in pixels:
-        color = QColor(*rgb)
-        ratio = contrast_ratio(color, background)
-        if ratio < 1.35:                      # 本质还是背景色（含抗锯齿边缘）
-            continue
-        text_pixels += 1
-        if ratio < 3.0:
-            bad_pixels += 1
+            row.append(rgb)
+        grid.append(row)
+    global_background = QColor(*histogram.most_common(1)[0][0])
+
+    def is_chip(rgb) -> bool:
+        """@brief 这个颜色能不能算"色块"（而不是表格底色）。"""
+        return contrast_ratio(QColor(*rgb), global_background) >= 1.4
+
+    rows, cols = len(grid), len(grid[0]) if grid else 0
+    #: 取局部众数的窗口半径（像素）
+    radius = 4
+    text_pixels = bad_pixels = 0
+    ratios = []
+    for row in range(rows):
+        for col in range(cols):
+            window = Counter()
+            for dy in range(-radius, radius + 1):
+                neighbor_row = row + dy
+                if not (0 <= neighbor_row < rows):
+                    continue
+                line = grid[neighbor_row]
+                for dx in range(-radius, radius + 1):
+                    neighbor_col = col + dx
+                    if 0 <= neighbor_col < cols:
+                        color = line[neighbor_col]
+                        window[(color.red(), color.green(), color.blue())] += 1
+            local = window.most_common(1)[0][0]
+            # 这一格底色必须是**色块**：网格线（浅灰线压在白底）会被自动排除，
+            # 那是装饰不是文字，算进来只会把数字搅乱
+            if not is_chip(local):
+                continue
+            rgb = (grid[row][col].red(), grid[row][col].green(), grid[row][col].blue())
+            if rgb == local:
+                continue                        # 色块内部
+            ratio = contrast_ratio(QColor(*rgb), QColor(*local))
+            if ratio < 1.4:
+                continue                        # 抗锯齿过渡色
+            text_pixels += 1
+            ratios.append(ratio)
+            if ratio < min_ratio:
+                bad_pixels += 1
+
+    ratios.sort()
     share = (100.0 * bad_pixels / text_pixels) if text_pixels else 0.0
-    return ('背景 %s；文字像素 %d 个，其中对比度 <3:1 的占 %.1f%%'
-            % (background.name(), text_pixels, share))
+    median = ratios[len(ratios) // 2] if ratios else 0.0
+    good = 100.0 * sum(1 for r in ratios if r >= 7.0) / len(ratios) if ratios else 0.0
+    return ('表格底色 %s；色块上的文字像素 %d 个，对比度 <%.1f:1 的占 %.1f%%'
+            '（中位数 %.1f:1，>=7:1 的占 %.1f%%）'
+            % (global_background.name(), text_pixels, min_ratio, share, median, good))
 
 
 def main() -> int:

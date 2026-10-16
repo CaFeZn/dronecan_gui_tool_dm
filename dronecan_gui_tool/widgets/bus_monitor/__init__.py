@@ -14,6 +14,7 @@ import multiprocessing
 from PyQt6.QtWidgets import QApplication
 from PyQt6.QtCore import QTimer
 from .window import BusMonitorWindow
+from .. import theme
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +72,30 @@ class IPCChannel:
         except queue.Empty:
             return False, None
 
+    def close(self):
+        """
+        @brief 关闭通道：先把积压倒干净，再关队列。
+
+        @note **不清空就直接关会挂住整个进程**：`multiprocessing.Queue` 的 feeder 线程在
+              "队列里还有数据、管道又写不进去"的时候会一直阻塞，解释器退出阶段
+              （`Queue._finalize_join`）要等它，结果就是 GUI 关不掉。监视器子进程此时
+              已经被 terminate，没人再来取数据，越积越死。上游原本根本没调过 close()，
+              队列里的积压（快总线上动辄几万条）就是这样把退出拖住的。
+        """
+        while True:
+            try:
+                self._q.get_nowait()
+            except (queue.Empty, OSError, ValueError):
+                break
+        try:
+            self._q.close()
+        except Exception:
+            pass
+        try:
+            self._q.cancel_join_thread()      # 兜底：解释器别再等 feeder 线程
+        except Exception:
+            pass
+
 
 IPC_COMMAND_STOP = 'stop'
 
@@ -81,6 +106,8 @@ def _process_entry_point(channel, iface_name):
 
     # Set the style for Qt6 to be same across systems
     app.setStyle("Fusion")
+    # 跟主窗口用同一套深浅外观（这是独立进程，读的是同一份 QSettings）
+    theme.apply_saved_mode(app)
 
     def exit_if_should():
         if RUNNING_ON_WINDOWS:
@@ -166,3 +193,11 @@ class BusMonitorManager:
                 proc.terminate()
             except Exception:
                 pass
+
+        # 子进程已经没了，剩下的积压必须由我们自己清掉，否则进程退不出去（见 IPCChannel.close）
+        for _, channel in self._inferiors:
+            try:
+                channel.close()
+            except Exception:
+                pass
+        self._inferiors = []

@@ -82,7 +82,9 @@ def colorize_can_id(frame):
     col = QColor()
     col.setRgb(0xFF, 0xFF - (mask - priority) * 6, 0xFF)
     # 本 fork：优先级 → 浅粉色，是按白底设计的；深色主题下做对比度适配
-    return theme.ensure_contrast(col)
+    # 这是**单元格背景**：只要跟表格底分得开，文字色由 readable_pair 按色块自适应
+    # 上游按"白底深字"设计的色块：浅色主题下原样返回，深色主题下才适配
+    return theme.adapt_upstream_chip(col)
 
 
 def colorize_transfer_id(frame):
@@ -99,7 +101,9 @@ def colorize_transfer_id(frame):
     col.setRgb(0xFF - red, 0xFF - green, 0xFF - blue)
     # 本 fork：这套"数据分组色"最深会到 (80,80,80)，在深色主题下基本看不见；
     # 保留色相、按当前背景做对比度适配
-    return theme.ensure_contrast(col)
+    # 这是**单元格背景**：只要跟表格底分得开，文字色由 readable_pair 按色块自适应
+    # 上游按"白底深字"设计的色块：浅色主题下原样返回，深色主题下才适配
+    return theme.adapt_upstream_chip(col)
 
 
 def formatted_data(frame):
@@ -132,25 +136,22 @@ class TimestampRenderer:
     def __init__(self):
         self._prev_ts = 0
 
-    #: 越旧越淡的最大淡出量（0 = 不淡出，1 = 与背景同色）
-    MAX_FADE = 0.7
-    #: 时间戳是次要信息，对比度下限放宽到 3:1（正文是 4.5:1）
-    MIN_FADE_CONTRAST = 3.0
-
     def __call__(self, e):
         ts = datetime.datetime.fromtimestamp(e[1].ts_real).strftime(self.FORMAT)
-        background = theme.background_color()
+        col = QColor()
 
         # Constraining delta to [0, 1]
         delta = min(1, e[1].ts_real - self._prev_ts)
         if delta < 0:
-            # 时间倒流（时钟跳变）：用警告色；上游那种浅粉在白底上就难看清
-            return ts, theme.semantic('warn', background)
-        self._prev_ts = e[1].ts_real
-        # 本 fork：原实现是"从白色往黑色插值"，深色主题下空闲 ≥1 s 的行会变成
-        # (63,63,63) 压在 #2D2D2D 上彻底看不清。改成**朝背景淡出**，并保证淡出后仍可读。
-        faded = theme.blend(theme.text_color(), background, delta * self.MAX_FADE)
-        return ts, theme.ensure_contrast(faded, background, self.MIN_FADE_CONTRAST)
+            col.setRgb(255, 230, 230)        # 时间倒流（时钟跳变）：原版的淡粉
+        else:
+            self._prev_ts = e[1].ts_real
+            # **原版公式，一个字没改**：白 = 刚到的帧，越旧越暗（最多淡到 (63,63,63)）。
+            # 浅色主题下 adapt_upstream_chip 原样返回，渲染结果与原版完全一致；
+            # 深色主题下它才会把色块抬到"跟表格底分得开"，文字色由 BasicTable 自适应。
+            col.setRgb(*([255 - int(192 * delta)] * 3))
+
+        return ts, theme.adapt_upstream_chip(col)
 
     @staticmethod
     def compute_timestamp_difference(earlier, later):

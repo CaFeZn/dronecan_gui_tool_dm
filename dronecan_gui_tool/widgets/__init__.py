@@ -13,7 +13,7 @@ import importlib.resources
 from PyQt6.QtWidgets import QTableWidget, QTableWidgetItem, QAbstractItemView, QHeaderView, QApplication, QWidget, \
     QComboBox, QCompleter, QPushButton, QHBoxLayout, QVBoxLayout, QMessageBox, QLineEdit
 from PyQt6.QtCore import Qt, QTimer, QStringListModel
-from PyQt6.QtGui import QColor, QKeySequence, QFont, QFontInfo, QIcon
+from PyQt6.QtGui import QColor, QKeySequence, QFont, QFontInfo, QIcon, QAction
 from logging import getLogger
 import qtawesome
 from functools import partial
@@ -121,7 +121,11 @@ class BasicTable(QTableWidget):
                 value, color = value
             w = QTableWidgetItem(str(value))
             if color is not None:
-                w.setBackground(color)
+                # 本 fork：这些颜色是**单元格背景**（彩色色块），文字色必须跟着它走——
+                # 否则深色主题下"浅色块 + 浅色字"等于看不见（见 theme.readable_pair）
+                cell_background, cell_foreground = theme.readable_pair(color)
+                w.setBackground(cell_background)
+                w.setForeground(cell_foreground)
             w.setTextAlignment(Qt.AlignVCenter | Qt.AlignLeft)
             w.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled)
             self.setItem(row, col, w)
@@ -631,6 +635,11 @@ class PasswordEdit(QLineEdit):
             self.setEchoMode(QLineEdit.EchoMode.Password)
         self._update_icon()
 
+#: `QIcon.cacheKey() -> (QIcon, 图标名)`。用于切换深浅主题时把**已经建好的**图标
+#: 重新染色：QIcon 是隐式共享的，菜单/工具栏里的副本与原对象 cacheKey 相同，凭它可以认回来。
+_icon_registry: dict = {}
+
+
 def get_icon(name):
     """
     @brief 取图标。
@@ -640,12 +649,59 @@ def get_icon(name):
 
     @note 本 fork：qtawesome 默认画**黑色**图标，深色主题下菜单/工具栏会看不见，
           这里统一用主题前景色；取不到时退回 qtawesome 默认行为。
+          取到的图标会登记进注册表，供 `refresh_icons()` 在换主题时重新染色。
     """
     try:
-        return qtawesome.icon(name, color=theme.icon_color().name())
+        icon = qtawesome.icon(name, color=theme.icon_color().name())
     except Exception:
         logger.warning('Could not load icon %r', name, exc_info=True)
         return QIcon()
+    try:
+        _icon_registry[icon.cacheKey()] = (icon, name)
+    except Exception:                      # pragma: no cover - 依赖环境
+        pass
+    return icon
+
+
+def refresh_icons(app=None):
+    """
+    @brief 换主题后，把所有由 `get_icon()` 建的图标换成当前主题的颜色。
+
+    @param app `QApplication`；None 时取当前实例
+    @return 重新染色的图标个数
+
+    @note 图标是在创建时把颜色"烤"进 pixmap 的，调色板变了它不会自己变——不重建的话，
+          深色切浅色会留下一堆浅色图标（看不见）。
+    """
+    if app is None:
+        app = QApplication.instance()
+    if app is None or not _icon_registry:
+        return 0
+
+    actions = []
+    try:
+        actions.extend(app.findChildren(QAction))
+    except Exception:                      # pragma: no cover - 依赖环境
+        pass
+    for widget in app.allWidgets():
+        actions.extend(widget.actions())
+
+    refreshed = 0
+    seen = set()
+    for action in actions:
+        if id(action) in seen:
+            continue
+        seen.add(id(action))
+        try:
+            entry = _icon_registry.get(action.icon().cacheKey())
+            if entry is None:
+                continue
+            # 必须走 get_icon()：它会把新图标登记进注册表，否则**第二次**换主题就找不到它了
+            action.setIcon(get_icon(entry[1]))
+            refreshed += 1
+        except Exception:                  # pragma: no cover - 依赖环境
+            continue
+    return refreshed
 
 
 def make_icon_button(icon_name, tool_tip, parent, checkable=False, checked=False, on_clicked=None, text=''):
@@ -671,9 +727,11 @@ def map_7bit_to_color(value):
 
     col = QColor()
     col.setRgb(0xFF - red, 0xFF - green, 0xFF - blue)
-    # 本 fork：上面这套颜色是按**白底**设计的（RGB 取反）。Qt6 跟随系统深色主题时，
-    # 其中一半取值会变成暗色、压在深色底上根本看不清；这里统一做对比度适配（保留色相）。
-    return theme.ensure_contrast(col)
+    # 本 fork：上面这套颜色是按**白底**设计的（RGB 取反），它被当**单元格背景**用。
+    # 只要求它跟表格底分得开（`CHIP_MIN_CONTRAST`），**不做**正文级的 4.5:1 调整——
+    # 那样会把浅色主题里原本近白的浅色块压成深色，反而没有原版清晰。
+    # 文字颜色由 `BasicTable.set_row` 调 `theme.readable_pair()` 按色块自适应。
+    return theme.adapt_upstream_chip(col)
 
 
 def get_monospace_font():

@@ -138,14 +138,63 @@ def main() -> int:
         results.append(path)
         print('[smoke] 面板截图：%s' % path)
         dump_panel(_panel)
+        exercise_appearance_menu()
         app.quit()
+
+    def exercise_appearance_menu() -> None:
+        """
+        @brief 把 View -> Appearance 菜单真点一遍：既验证菜单接上了，也产出两种主题的截图。
+
+        @note 用仿真后端也能跑，不需要硬件。
+        """
+        from PyQt6.QtCore import QSettings
+        from dronecan_gui_tool.widgets import theme
+
+        # 精确还原：原先没有这个键就删掉，别给用户留一个"测试选的主题"
+        settings = QSettings(theme.SETTINGS_ORGANIZATION, theme.SETTINGS_APPLICATION)
+        previous_value = settings.value(theme.SETTINGS_KEY, None)
+        window_menu = None
+        for action in window.menuBar().actions():
+            if action.text().replace('&', '') == 'View':
+                window_menu = action.menu()
+        assert window_menu is not None, '主窗口没有 View 菜单'
+
+        appearance_menu = None
+        for action in window_menu.actions():
+            if action.menu() is not None and action.text().replace('&', '') == 'Appearance':
+                appearance_menu = action.menu()
+        assert appearance_menu is not None, 'View 下面没有 Appearance 子菜单'
+
+        entries = {a.text().replace('&', ''): a for a in appearance_menu.actions()}
+        print('[smoke] Appearance 菜单项：%s' % list(entries))
+        for label, expected in (('Dark', theme.MODE_DARK), ('Light', theme.MODE_LIGHT)):
+            assert label in entries, '菜单里没有 %r' % label
+            entries[label].trigger()
+            app.processEvents()
+            print('[smoke] 点 %s -> 生效 %s，表格底色 %s'
+                  % (label, theme.mode(), theme.background_color().name()))
+            assert theme.mode() == expected, '%s 没有生效' % label
+            path = os.path.join(ARTIFACTS, 'appearance_%s.png' % expected)
+            window.grab().save(path)
+            results.append(path)
+
+        entries['Follow System'].trigger()
+        app.processEvents()
+        assert theme.mode() == theme.MODE_SYSTEM, '切不回跟随系统'
+
+        if previous_value is None:
+            settings.remove(theme.SETTINGS_KEY)
+        else:
+            settings.setValue(theme.SETTINGS_KEY, previous_value)
+        settings.sync()
+        print('[smoke] 菜单切换正常，偏好已还原为 %r' % previous_value)
 
     QTimer.singleShot(int(args.seconds * 1000), shoot_main)
     app.exec()
 
     node.close()
     print('[smoke] 完成，产出：%s' % ', '.join(results))
-    return 0 if len(results) == 2 else 1
+    return 0 if len(results) >= 2 else 1
 
 
 if __name__ == '__main__':

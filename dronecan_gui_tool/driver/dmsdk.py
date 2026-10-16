@@ -104,15 +104,27 @@ def _library_names() -> tuple:
 
 
 def _candidate_dirs() -> List[str]:
-    """@brief 本项目补的查找目录：程序目录与包目录下的 `dlls/`。"""
+    """
+    @brief 本项目补的查找目录：程序目录与包目录下的 `dlls/`。
+
+    @note 打包成 exe（PyInstaller）后 `__file__` 指向临时解包目录，用户真正会去放
+          `libdmcan` 的地方是 **exe 旁边**（`<exe目录>/dlls/`），所以冻结时要优先看那里。
+    """
     here = os.path.dirname(os.path.abspath(__file__))
     package_root = os.path.dirname(here)
     app_root = os.path.dirname(package_root)
+    ordered: List[str] = []
+    if getattr(sys, 'frozen', False):
+        exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+        unpack_dir = getattr(sys, '_MEIPASS', '')
+        ordered += [os.path.join(exe_dir, 'dlls'), exe_dir,
+                    os.path.join(unpack_dir, 'dlls') if unpack_dir else '', unpack_dir]
+    ordered += [os.path.join(app_root, 'dlls'),
+                os.path.join(package_root, 'dlls'),
+                here, app_root,
+                os.path.join(os.getcwd(), 'dlls'), os.getcwd()]
     out: List[str] = []
-    for directory in (os.path.join(app_root, 'dlls'),
-                      os.path.join(package_root, 'dlls'),
-                      here, app_root,
-                      os.path.join(os.getcwd(), 'dlls'), os.getcwd()):
+    for directory in ordered:
         if directory and directory not in out and os.path.isdir(directory):
             out.append(directory)
     return out

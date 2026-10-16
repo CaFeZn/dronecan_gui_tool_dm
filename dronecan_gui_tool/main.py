@@ -29,6 +29,9 @@ parser.add_argument("--bus", help="set the CAN Bus number", type=int, default=1)
 parser.add_argument("--filtered", action='store_true', help="enable filtering of DroneCAN traffic")
 parser.add_argument("--target-system", help="set the targetted system", type=int, default=0)
 parser.add_argument("--source-system", help="set the source system", type=int, default=250)
+# 本 fork：外观模式。命令行给的值只对本次运行生效，不会写回偏好（偏好由 View -> Appearance 管）
+parser.add_argument("--appearance", choices=('system', 'dark', 'light'), default=None,
+                    help="force the appearance for this run: system (follow the OS), dark or light")
 
 args = parser.parse_args()
 
@@ -80,7 +83,7 @@ from serial import SerialException
 import dronecan
 
 from PyQt6.QtWidgets import QApplication, QMainWindow, QWidget, QVBoxLayout, QSplitter
-from PyQt6.QtGui import QKeySequence, QDesktopServices, QAction
+from PyQt6.QtGui import QKeySequence, QDesktopServices, QAction, QActionGroup
 from PyQt6.QtCore import QTimer, Qt, QUrl
 
 from .setup_window import run_setup_window
@@ -89,7 +92,7 @@ from .active_data_type_detector import ActiveDataTypeDetector
 # 没装 dmsdk 时它退化成"什么都不做"，其余后端仍原样交给 pydronecan。
 from .driver import make_node as make_extended_node, is_dmcan_driver
 
-from .widgets import show_error, get_icon, get_app_icon
+from .widgets import show_error, get_icon, get_app_icon, refresh_icons, theme
 from .widgets.node_monitor import NodeMonitorWidget
 from .widgets.local_node import LocalNodeWidget
 from .widgets.local_node import AdapterSettingsWidget
@@ -163,6 +166,22 @@ class MainWindow(QMainWindow):
 
         file_menu = self.menuBar().addMenu('&File')
         file_menu.addAction(quit_action)
+
+        #
+        # View menu（本 fork 新增：外观模式）
+        #
+        appearance_menu = self.menuBar().addMenu('&View').addMenu('&Appearance')
+        appearance_group = QActionGroup(self)
+        appearance_group.setExclusive(True)
+        for mode_id, mode_label in theme.MODE_LABELS:
+            appearance_action = QAction(mode_label, self)
+            appearance_action.setCheckable(True)
+            appearance_action.setChecked(theme.mode() == mode_id)
+            appearance_action.setStatusTip('Set the tool appearance; remembered for next start')
+            appearance_action.triggered.connect(
+                lambda _checked=False, selected=mode_id: self._set_appearance(selected))
+            appearance_group.addAction(appearance_action)
+            appearance_menu.addAction(appearance_action)
 
         #
         # Tools menu
@@ -590,6 +609,25 @@ class MainWindow(QMainWindow):
             logger.error(msg, exc_info=True)
             self.statusBar().showMessage(msg, 3000)
 
+    def _set_appearance(self, mode_id: str) -> None:
+        """
+        @brief 切换外观模式（View -> Appearance）并立刻生效，同时记住选择。
+
+        @param mode_id `theme.MODES` 之一
+
+        @note 调色板当场换、图标当场重染；**已经画出来的表格行**要等下一次刷新才会用新
+              配色（总线监视器是毫秒级）。已经打开的 Bus Monitor / Plotter 是独立进程，
+              它们下次打开时才会用上新模式。
+        """
+        theme.save_mode(mode_id)
+        applied = theme.apply_mode(QApplication.instance(), mode_id)
+        refreshed = refresh_icons(QApplication.instance())
+        for widget in QApplication.instance().topLevelWidgets():
+            widget.style().unpolish(widget)
+            widget.style().polish(widget)
+            widget.update()
+        logger.info('Appearance mode changed to %r; %d icons refreshed', applied, refreshed)
+
     def closeEvent(self, qcloseevent):
         self._plotter_manager.close()
         self._console_manager.close()
@@ -602,6 +640,15 @@ def main():
 
     # Set the style for Qt6 to be same across systems
     app.setStyle("Fusion")
+
+    # 本 fork：外观模式（跟随系统 / 强制深色 / 强制浅色），存 QSettings，见 View -> Appearance。
+    # 必须在建任何窗口之前应用，否则会先按旧主题画一遍。
+    # --appearance 只是本次运行的临时覆盖，不写回偏好。
+    if args.appearance:
+        logger.info('Appearance mode: %s (from --appearance, not saved)',
+                    theme.apply_mode(app, args.appearance))
+    else:
+        logger.info('Appearance mode: %s (saved preference)', theme.apply_saved_mode(app))
 
     while True:
         # Asking the user to specify which interface to work with
