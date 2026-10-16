@@ -4,7 +4,7 @@
 # 本文件不属于上游 DroneCAN/gui_tool，为本 fork 新增；与上游同样以 MIT 发布（见 LICENSE）。
 #
 """
-dmcan 适配器控制面板：位定时、实时统计（含丢帧细分）、回环自检。
+dmcan 适配器控制面板：设备身份、位定时、实时统计（含丢帧细分）、通道使能。
 
 上游的 `CAN Adapter Control Panel` 是 SLCAN CLI 专用的，对 USB 后端没有意义；
 本面板提供 dmcan 后端真正需要的东西：
@@ -13,8 +13,10 @@ dmcan 适配器控制面板：位定时、实时统计（含丢帧细分）、�
 * **位定时**：仲裁段 / 数据段、是否 CAN FD；应用只改运行期，落盘要点"存入闪存"；
 * **1 Hz 实时统计**：设备侧累计与每秒增量，并把 `rx_dropped` / `tx_dropped` 拆到具体原因
   （队列满 = 主机读得不够快；内部资源 = 设备侧；无额度/提交失败 = 总线或 MCAN 侧）；
-* **主机侧收帧丢弃**：本进程收帧队列溢出次数，这是"GUI 卡住丢帧"的直接证据；
-* **外部回环自检**：不接线、单模块自发自收，直接给出丢帧数与往返延迟。
+* **主机侧收帧丢弃**：本进程收帧队列溢出次数，这是"GUI 卡住丢帧"的直接证据。
+
+> 不接线的自检不在面板里做（它会临时把通道切到回环、真的往总线上发帧），
+> 需要时用命令行：`dmcan-dronecan-tool selftest dmcan:0.1@1000000`。
 
 界面取舍（都是为了让数字**一眼能读**）：正文用系统 UI 字体、只有数值列用等宽字体；
 身份信息按"标签 / 值"两列对齐；统计按 接收 / 发送 / 主机侧 / 总线 分区，数字右对齐、
@@ -31,7 +33,7 @@ from PyQt6.QtCore import Qt, QObject, QTimer, pyqtSignal
 from PyQt6.QtGui import QBrush, QColor, QFont
 from PyQt6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QFormLayout, QFrame,
                              QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel,
-                             QMessageBox, QPushButton, QSizePolicy, QTableWidget,
+                             QPushButton, QSizePolicy, QTableWidget,
                              QTableWidgetItem, QVBoxLayout, QWidget)
 
 from .. import get_monospace_font, show_error, theme
@@ -116,7 +118,7 @@ def _mono_font(point_delta: int = 0, bold: bool = False) -> QFont:
 
 
 class _Worker(QObject):
-    """把会阻塞的 SDK 调用（改位定时 ~1.2 s、回环自检数秒）挪到后台线程。"""
+    """把会阻塞的 SDK 调用（改位定时、写 Flash 等，约 1.2 s 生效）挪到后台线程。"""
 
     done = pyqtSignal(object)
     failed = pyqtSignal(str)
@@ -177,8 +179,9 @@ class DmCanControlPanel(QWidget):
         layout.addWidget(self._build_control_box())
         layout.addWidget(self._build_stats_box(), 1)
 
-        note = QLabel('判链路是否丢帧看"外部回环自检"；'
-                      '"接收队列满"说明主机读得不够快，"主机侧收帧丢弃"说明本进程卡住了。', self)
+        note = QLabel('判链路丢帧看这两项："接收队列满"说明主机读得不够快，'
+                      '"主机侧收帧丢弃"说明本进程卡住了；'
+                      '不接线自检可以用命令行 selftest。', self)
         note.setStyleSheet('color: %s;' % theme.semantic('muted').name())
         note.setToolTip('设备侧统计来自固件 1 Hz 周期上报，是**累计值**，表里"每秒"列才是增量。\n'
                         '丢帧细分只在固件对应记录到达后才有效（drop_flags），刚打开的一两秒内可能显示 0。')
@@ -236,7 +239,6 @@ class DmCanControlPanel(QWidget):
             ('使能通道', '打开通道（关机/复位后通道默认是关的）', lambda: self._toggle_channel(True)),
             ('关闭通道', '关闭通道，停止收发', lambda: self._toggle_channel(False)),
             ('清 bus-off', '清掉通道的 bus-off 状态', self._clear_bus_off),
-            ('外部回环自检…', '不接线自发自收，验证整条收发链路（会临时切模式）', self._self_test),
         )
         for index, (text, tip, handler) in enumerate(buttons):
             button = QPushButton(text, self)
@@ -373,15 +375,8 @@ class DmCanControlPanel(QWidget):
         self._worker.run(function)
 
     def _on_worker_done(self, result) -> None:
-        """@brief 后台任务成功：刷新显示，自检结果单独弹窗。"""
+        """@brief 后台任务成功：刷新显示（`result` 是信号载荷，当前几个任务都不回传数据）。"""
         self._busy = False
-        if result is not None and hasattr(result, 'summary'):
-            box = QMessageBox(self)
-            box.setWindowTitle('回环自检结果')
-            box.setText(result.summary())
-            box.setInformativeText(result.detail)
-            box.setIcon(QMessageBox.Icon.Information)
-            box.show()
         self._load_identity()
         self._last_stats = None
         self._refresh()
@@ -423,31 +418,6 @@ class DmCanControlPanel(QWidget):
             self._driver.clear_bus_off()
         except Exception as ex:
             show_error('清 bus-off 失败', str(ex), None, self)
-
-    def _self_test(self) -> None:
-        """@brief 外部回环自检（会临时切模式，需确认）。"""
-        answer = QMessageBox.question(
-            self, '外部回环自检',
-            '将把通道临时切到"外部回环"模式并自发自收 1000 帧，期间：\n'
-            '• 帧照常驱动总线（总线上其它节点会看到这批测试帧）；\n'
-            '• 本机在这几秒内不接收正常总线流量；\n'
-            '• 测完自动恢复原来的模式与位定时。\n\n'
-            '建议在没有其它节点、或确认可以短暂打断时执行。是否继续？',
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No)
-        if answer != QMessageBox.StandardButton.Yes:
-            return
-        session = self._driver.session
-        driver = self._driver
-
-        def job():
-            driver.pause_rx(True)
-            try:
-                return session.self_test(count=1000, timeout=5.0)
-            finally:
-                driver.pause_rx(False)
-
-        self._run_async('外部回环自检', job)
 
     # ------------------------------------------------------------------ 刷新
     def _refresh(self) -> None:

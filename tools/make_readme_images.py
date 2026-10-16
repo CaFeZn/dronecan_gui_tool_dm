@@ -46,18 +46,28 @@ def ink_ratio(image) -> float:
 
 def render_panel() -> str:
     """@brief 渲染达妙适配器控制面板（仿真 SDK，不需要硬件）。"""
+    # 截图不需要 HiDPI：不固定缩放比的话，抓出来是 1.5 倍大小、而且窗口内容只占左半边
+    os.environ.setdefault('QT_SCALE_FACTOR', '1')
     sys.path.insert(0, PROJECT_ROOT)
     from PyQt6.QtWidgets import QApplication, QMainWindow
     from tests import fake_dmcan
 
     fake_dmcan.install([fake_dmcan.make_dual(serial='MOCKDEV', index=0)])
 
-    import dronecan
-    import dronecan_gui_tool.main as gui
-    from dronecan_gui_tool.widgets.dmcan_control_panel import spawn_window
+    # 上游 main.py 在 **import 时**就解析 sys.argv；不清理会把本脚本的参数喂给它（报 unrecognized arguments）
+    saved_argv = sys.argv
+    sys.argv = ['dronecan_gui_tool', '--interface', 'dmcan:s:MOCKDEV.0']
+    try:
+        import dronecan
+        import dronecan_gui_tool.main as gui
+        from dronecan_gui_tool.widgets.dmcan_control_panel import spawn_window
+    finally:
+        sys.argv = saved_argv
 
     app = QApplication(['make-readme-images'])
     app.setStyle('Fusion')
+    from dronecan_gui_tool.widgets import theme
+    theme.apply_mode(app, theme.MODE_DARK)        # 与总线监视器截图保持同一主题（只改调色板，不写偏好）
 
     iface = 'dmcan:s:MOCKDEV.0'
     iface_kwargs = dict(baudrate=115200, bitrate=1000000, bus_number=1, filtered=False,
